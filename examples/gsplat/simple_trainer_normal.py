@@ -27,8 +27,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
-# torch.backends.cudnn.enabled = False
-# torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.enabled = False
+torch.backends.cudnn.benchmark = False
 
 import tqdm
 import tyro
@@ -73,7 +73,7 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 from gsplat import export_splats
-from Difix3D.examples.utils_zpz import CameraPoseInterpolator
+from Difix3D.examples.utils_old import CameraPoseInterpolator
 from src.pipeline_difix import DifixPipeline
 
 
@@ -112,20 +112,20 @@ class Config:
     batch_size: int = 1
     # A global factor to scale the number of training steps
     steps_scaler: float = 1.0
-
+    # Whether to save ply files of the GSs during training. 
+    save_ply: bool = True
+    # Steps to save ply files
+    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 60_000])
     # Number of training steps
     max_steps: int = 30_000
-    # renders step
-    render_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [1_0000, 2_0000, 3_0000, 3_5000, 4_0000, 4_5000, 5_0000, 5_5000, 6_0000])
+    eval_steps: List[int] = field(default_factory=lambda: [1_000, 1_0000, 2_0000, 3_0000, 3_5000, 4_0000, 4_5000, 5_0000, 5_5000, 6_0000])
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [1_0000, 2_0000, 3_0000, 4_0000, 4_5000, 5_0000, 5_5000, 6_0000])
     # Steps to fix the artifacts
-    # fix_steps: List[int] = field(default_factory=lambda: [3_000, 6_000, 8_000, 10_000, 12_000, 14_000, 16_000, 18_000, 20_000, 22_000, 24_000, 26_000, 28_000, 30_000, 32_000, 34_000, 36_000, 38_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 52_000, 54_000, 56_000, 58_000, 60_000])
-    fix_steps: List[int] = field(default_factory=lambda: [1_000, 12_000, 14_000, 16_000, 18_000, 20_000, 22_000, 24_000, 26_000, 28_000, 30_000, 32_000, 34_000, 36_000, 38_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 52_000, 54_000, 56_000, 58_000, 60_000])
-    save_ply: bool = True
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000, 60_000])
+    fix_steps: List[int] = field(default_factory=lambda: [1000, 3_000, 6_000, 8_000, 10_000, 12_000, 14_000, 16_000, 18_000, 20_000, 22_000, 24_000, 26_000, 28_000, 30_000, 32_000, 34_000, 36_000, 38_000, 40_000, 42_000, 44_000, 46_000, 48_000, 50_000, 52_000, 54_000, 56_000, 58_000, 60_000])
+    # render the results
+    render_steps: List[int] = field(default_factory=lambda: [30_000, 60_000])
     # Initialization strategy
     init_type: str = "sfm"
     # Initial number of GSs. Ignored if using sfm
@@ -143,8 +143,8 @@ class Config:
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
     # Weight for iterative 3d update
-    # novel_data_lambda: float = 0.3
-    novel_data_lambda: float = 0.7
+    novel_data_lambda: float = 0.3
+
     # Near plane clipping distance
     near_plane: float = 0.01
     # Far plane clipping distance
@@ -171,17 +171,6 @@ class Config:
     # Scale regularization
     scale_reg: float = 0.0
 
-    # opacity_mask
-    opacity_mask_reg: float = 0.02
-    # alpth_tv_reg
-    alpha_tv_reg: float = 0.0001
-    # anisotropy_reg
-    anisotropy_reg: float = 0.001
-    # perturb_reg
-    perturb_reg: float = 0.1
-    # sds_weight
-    sds_weight: float = 0.01
-
     # Enable camera optimization.
     pose_opt: bool = False
     # Learning rate for camera optimization
@@ -190,6 +179,14 @@ class Config:
     pose_opt_reg: float = 1e-6
     # Add noise to camera extrinsics. This is only to test the camera pose optimization.
     pose_noise: float = 0.0
+
+    # opacity_mask
+    # opacity_mask_reg: float = 0.02
+    opacity_mask_reg: float = 0.1
+    # alpth_tv_reg
+    alpha_tv_reg: float = 0.001
+    # anisotropy_reg
+    anisotropy_reg: float = 0.01
 
     # Enable appearance optimization. (experimental)
     app_opt: bool = False
@@ -262,37 +259,6 @@ def create_splats_with_optimizers(
         rgbs = torch.rand((init_num_pts, 3))
     else:
         raise ValueError("Please specify a correct init_type: sfm or random")
-
-
-    # ====== 【Difix3D 新增: 强行加载高精度初始点云】 ======
-    if len(points) == 0:
-        print("⚠️ 未从 txt/bin 中读到特征点，尝试强行加载 points3D.ply ...")
-        try:
-            from plyfile import PlyData
-            import os
-            ply_path = os.path.join(parser.data_dir, "sparse/0/points3D.ply")
-            plydata = PlyData.read(ply_path)
-            x = np.asarray(plydata.elements[0]["x"])
-            y = np.asarray(plydata.elements[0]["y"])
-            z = np.asarray(plydata.elements[0]["z"])
-            points = np.stack([x, y, z], axis=1)
-            
-            try:
-                r = np.asarray(plydata.elements[0]["red"])
-                g = np.asarray(plydata.elements[0]["green"])
-                b = np.asarray(plydata.elements[0]["blue"])
-                rgbs = np.stack([r, g, b], axis=1) / 255.0
-            except:
-                rgbs = np.random.rand(*points.shape)
-                
-            points = torch.tensor(points, dtype=torch.float32, device=device)
-            rgbs = torch.tensor(rgbs, dtype=torch.float32, device=device) # 👈 修正：改名为 rgbs
-            print(f"✅ 成功从 points3D.ply 抢救回 {len(points)} 个高精点云！")
-        except Exception as e:
-            print(f"❌ 读取 PLY 失败: {e}，将使用随机点云初始化。")
-            points = torch.rand((100000, 3), device=device) * 2 - 1
-            rgbs = torch.rand((100000, 3), device=device) # 👈 修正：改名为 rgbs
-
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -380,7 +346,6 @@ class Runner:
         os.makedirs(self.render_dir, exist_ok=True)
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
-
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
@@ -744,140 +709,73 @@ class Runner:
             loss_opacity_mask = torch.tensor(0.0, device=device)
             loss_alpha_tv = torch.tensor(0.0, device=device)
             loss_anisotropy = torch.tensor(0.0, device=device)
-            
-            # 维度转换供 SSIM/LPIPS 使用 [1, 3, H, W]
-            colors_p = colors.permute(0, 3, 1, 2)
-            pixels_p = pixels.permute(0, 3, 1, 2)
 
-            # 确定当前有效 Mask 和裁剪 BBox
             if masks is not None:
-                curr_mask = masks.unsqueeze(1)
+                pixels = pixels * masks.unsqueeze(-1).float()
+                colors = colors * masks.unsqueeze(-1).float()  # 新增，更严谨
+                
+                l1loss = torch.sum(torch.abs(colors - pixels)) / (
+                    masks.sum() * 3 + 1e-7
+                )
+
+                # 1. loss_opacity_mask
+                if cfg.opacity_mask_reg > 0.0:
+                    background_mask = 1.0 - masks.unsqueeze(-1).float()
+                    loss_opacity_mask = (alphas * background_mask).mean()
+
+                # 2. Alpha TV 正则化
+                if cfg.alpha_tv_reg > 0.0:
+                    loss_alpha_tv = self.compute_tv_loss(alphas)
+
+                # 3. 长短轴比例限制
+                if cfg.anisotropy_reg > 0.0:
+                    scales = torch.exp(self.splats["scales"])
+                    max_s = torch.max(scales, dim=-1).values
+                    min_s = torch.min(scales, dim=-1).values
+                    loss_anisotropy = (max_s / (min_s + 1e-7)).mean()
             else:
-                # 新视角下，相信模型已经长出来的形状 (阈值过滤)
-                curr_mask = (alphas.permute(0, 3, 1, 2) > 0.1).float()
+                l1loss = F.l1_loss(colors, pixels)
 
-            mask_inds = torch.where(curr_mask > 0.5)
-            if len(mask_inds[0]) > 0:
-                y_min, y_max = mask_inds[2].min(), mask_inds[2].max()
-                y_max = max(y_max, y_min + 1) # 防止切片大小为0
-                x_min, x_max = mask_inds[3].min(), mask_inds[3].max()
-                x_max = max(x_max, x_min + 1)
-                
-                pad = 1
-                crop_colors = colors_p[:, :, max(0, y_min-pad):min(height, y_max+pad), max(0, x_min-pad):min(width, x_max+pad)]
-                crop_pixels = pixels_p[:, :, max(0, y_min-pad):min(height, y_max+pad), max(0, x_min-pad):min(width, x_max+pad)]
-                
-                # 统一缩放到 224 以适配 LPIPS
-                train_crop_colors = F.interpolate(crop_colors, size=(224, 224), mode='bilinear', align_corners=False)
-                train_crop_pixels = F.interpolate(crop_pixels, size=(224, 224), mode='bilinear', align_corners=False)
-            else:
-                train_crop_colors, train_crop_pixels = colors_p, pixels_p
-
-            # --------------------------------------------------
-            # 2. 严格的几何正则项 (核心改动：限制大小和形状)
-            # --------------------------------------------------
-            # 获取物理尺寸
-            scales = torch.exp(self.splats["scales"]) # [N, 3]
-            max_s = torch.max(scales, dim=-1).values
-            min_s = torch.min(scales, dim=-1).values
-            
-            # (A) 绝对尺寸限制：防止高斯球太大凸出来
-            # 如果最大直径超过 0.1 (根据场景比例调整)，则产生惩罚
-            loss_scale_limit = torch.mean(F.relu(max_s - 0.1))
-            
-            # (B) 形状比例限制 (Anisotropy)：防止变成“面条”
-            # 允许长短轴比在 1~5 之间，超过 5 倍就开始猛烈惩罚
-            ratio = max_s / (min_s + 1e-7)
-            loss_anisotropy = torch.mean(F.relu(ratio - 5.0))
-            
-            # (C) 总体平滑度 (TV)
-            loss_alpha_tv = self.compute_tv_loss(alphas) if cfg.alpha_tv_reg > 0.0 else torch.tensor(0.0, device=device)
-
-            # --------------------------------------------------
-            # 3. 分支逻辑
-            # --------------------------------------------------
-            if is_novel_data:
-                # 【新视角：大模型修复数据】
-                diff = torch.abs(colors - pixels)
-                l1loss = (diff * alphas).sum() / (alphas.sum() * 3 + 1e-7)
-                
-                pred_ssim = train_crop_colors.clamp(0.0, 1.0)
-                gt_ssim = train_crop_pixels.clamp(0.0, 1.0)
-                if pred_ssim.dim() == 3:
-                    pred_ssim = pred_ssim.unsqueeze(0)
-                    gt_ssim = gt_ssim.unsqueeze(0)
-                
-                # 👇 这里名字统一改回 ssimloss
-                ssimloss = 1.0 - fused_ssim(pred_ssim, gt_ssim, padding="valid")
-                loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-                
-                # 几何约束
-                loss += cfg.alpha_tv_reg * loss_alpha_tv
-                loss += 0.2 * loss_anisotropy  
-                loss += 0.5 * loss_scale_limit 
-                loss = loss * cfg.novel_data_lambda
-
-            else:
-                # 【真实视角：官方原始数据】
-                if masks is not None:
-                    mask_f = masks.unsqueeze(-1).float()
-                    l1loss = torch.sum(torch.abs(colors - pixels) * mask_f) / (mask_f.sum() * 3 + 1e-7)
-                    loss_opacity_mask = (alphas * (1.0 - mask_f)).mean() if cfg.opacity_mask_reg > 0.0 else torch.tensor(0.0, device=device)
-                else:
-                    l1loss = F.l1_loss(colors, pixels)
-                    loss_opacity_mask = torch.tensor(0.0, device=device)
-
-                pred_ssim = train_crop_colors.clamp(0.0, 1.0)
-                gt_ssim = train_crop_pixels.clamp(0.0, 1.0)
-                if pred_ssim.dim() == 3:
-                    pred_ssim = pred_ssim.unsqueeze(0)
-                    gt_ssim = gt_ssim.unsqueeze(0)
-                
-                # 👇 这里名字也统一改回 ssimloss
-                ssimloss = 1.0 - fused_ssim(pred_ssim, gt_ssim, padding="valid")
-                loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
-                
-                loss += cfg.opacity_mask_reg * loss_opacity_mask
-                loss += cfg.alpha_tv_reg * loss_alpha_tv
-                loss += 0.05 * loss_anisotropy 
-                loss = loss * 1.5
+            ssimloss = 1.0 - fused_ssim(
+                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+            )
+            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            loss += cfg.opacity_mask_reg * loss_opacity_mask
+            loss += cfg.alpha_tv_reg * loss_alpha_tv
+            loss += cfg.anisotropy_reg * loss_anisotropy
 
             if cfg.depth_loss:
-                # query depths from depth map
                 points = torch.stack(
                     [
                         points[:, :, 0] / (width - 1) * 2 - 1,
                         points[:, :, 1] / (height - 1) * 2 - 1,
                     ],
                     dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                )
+                grid = points.unsqueeze(2)
                 depths = F.grid_sample(
                     depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
+                )
+                depths = depths.squeeze(3).squeeze(1)
                 disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
+                disp_gt = 1.0 / depths_gt
                 depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
+
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
 
             # regularizations
             if cfg.opacity_reg > 0.0:
-                loss = (
-                    loss
-                    + cfg.opacity_reg
-                    * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
-                )
+                loss += cfg.opacity_reg * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
             if cfg.scale_reg > 0.0:
-                loss = (
-                    loss
-                    + cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
-                )
+                loss += cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
 
+            if is_novel_data:
+                loss = loss * cfg.novel_data_lambda
+            else:
+                loss = loss * 1.5
             loss.backward()
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
@@ -934,6 +832,7 @@ class Runner:
                 torch.save(
                     data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
+
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
@@ -968,6 +867,7 @@ class Runner:
                     format="ply",
                     save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
                 )
+
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -1013,8 +913,9 @@ class Runner:
             for scheduler in schedulers:
                 scheduler.step()
 
+            # Run post-backward steps after backward and optimizer
             if masks is not None:
-                if step % 160 == 0:
+                if step % 160 == 0 and step < 25000:
                     self.filter_external_gs(data, info, step)
                 else:
                 # Run post-backward steps after backward and optimizer
@@ -1038,18 +939,18 @@ class Runner:
                         )
                     else:
                         assert_never(self.cfg.strategy)
-
+            
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
 
             # run fixer
             # if step in [i - 1 for i in cfg.fix_steps]:
-            #     self.fix(step)
+            #     self.fix_zpz_pose_update(step)
 
             if step in [i - 1 for i in cfg.render_steps]:
-                self.render_final_video()
-                
+                self.render_final_video(step)
+
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
                 self.run_compression(step=step)
@@ -1065,186 +966,36 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
     
-
-
-    def compute_tv_loss(self, image):
-        """
-        计算图像的全变分损失
-        image shape: [1, H, W, 1] (Alpha图) 或 [1, H, W, 3] (Color图)
-        """
-        # 计算水平方向和垂直方向相邻像素的差值
-        # tv_h: 第 i 行和第 i+1 行的差
-        tv_h = torch.abs(image[:, 1:, :, :] - image[:, :-1, :, :]).sum()
-        # tv_w: 第 j 列和第 j+1 列的差
-        tv_w = torch.abs(image[:, :, 1:, :] - image[:, :, :-1, :]).sum()
-
-        # 返回平均值，防止图片分辨率不同导致 Loss 量级爆炸
-        return (tv_h + tv_w) / image.numel()
-
     @torch.no_grad()
-    def filter_external_gs(self, data, info, step):
-        if "mask" not in data or data["mask"] is None:
-            return
-
-        device = self.device
-
-        # 1. 预处理 Mask: 确保是 [H, W]
-        mask = data["mask"].to(device).squeeze()
-        if mask.dim() > 2:
-            mask = mask[0]
-        H, W = mask.shape
-
-        # 2. 获取并修正 means2d 维度 [N, 2]
-        means2d = info["means2d"]
-        if means2d.dim() == 3:
-            means2d = means2d.squeeze(0)
-
-        n_total = means2d.shape[0]
-
-        # 3. 坐标转换与视口判定
-        u = means2d[:, 0].long()
-        v = means2d[:, 1].long()
-
-        in_view_mask = (u >= 0) & (u < W) & (v >= 0) & (v < H)
-
-        # 4. 判定背景点
-        external_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
-
-        if in_view_mask.any():
-            in_view_indices = torch.where(in_view_mask)[0]
-            # 直接索引 Mask (注意 [row, col] -> [v, u])
-            sampled_values = mask[v[in_view_mask], u[in_view_mask]]
-            is_background = sampled_values < 0.5
-            external_mask[in_view_indices[is_background]] = True
-
-        n_filter = external_mask.sum().item()
-
-        # --- DEBUG 打印 ---
-        if self.world_rank == 0:
-            print(
-                f"[Step {step}] View Stats: Total GS={n_total}, In-View={in_view_mask.sum().item()}, External={int(n_filter)}"
-            )
-
-        if n_filter == 0:
-            return
-
-        # 5. 执行操作
-        if isinstance(self.cfg.strategy, DefaultStrategy):
-            from gsplat.strategy.default import remove
-
-            remove(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                mask=external_mask,
-            )
-        elif isinstance(self.cfg.strategy, MCMCStrategy):
-            from gsplat.strategy.mcmc import relocate
-
-            # --- 核心修复：确保 binoms 在 CUDA 上 ---
-            binoms = self.strategy_state["binoms"].to(device)
-
-            relocate(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state={},
-                mask=external_mask,
-                binoms=binoms,
-                min_opacity=self.cfg.strategy.min_opacity,
-            )
-
-        if self.world_rank == 0:
-            print(f"[Step {step}] Mask Filter: {int(n_filter)} GSs processed.")
-
-            
-    @torch.no_grad()
-    def fix_test(self, step: int):
-        """
-        修复函数：保持 cuDNN 开启，但通过显式句柄重置确保稳定性。
-        """
-        print(f"\n🚀 [Reconstruction] Starting at step {step}...")
-        
-        # --- 1. 动态位姿策略 ---
-        if self.fix_count % 2 == 0:
-            dynamic_elevation = 0.1 + (self.fix_count // 2) * 0.01
+    def fix(self, step: int):
+        print("Running fixer...")
+        if len(self.cfg.fix_steps) == 1:
+            novel_poses = self.parser.camtoworlds[self.valset.indices]
         else:
-            dynamic_elevation = 0.1 - (self.fix_count // 2) * 0.01
-        dynamic_elevation = np.clip(dynamic_elevation, 0.1, 0.35)
-        dynamic_distance = min(0.15 + (self.fix_count * 0.02), 0.4) 
-
-        novel_poses = self.interpolator.shift_poses(
-            training_poses=self.parser.camtoworlds, 
-            testing_poses=self.parser.camtoworlds[self.valset.indices], 
-            distance=dynamic_distance, 
-            elevation_amount=dynamic_elevation
-        )
-        self.fix_count += 1 
-
-        # 渲染轨迹
+            novel_poses = self.interpolator.shift_poses(self.current_novel_poses, self.parser.camtoworlds[self.valset.indices], distance=0.5)
+        
         self.render_traj(step, novel_poses)
         image_paths = [f"{self.render_dir}/novel/{step}/Pred/{i:04d}.png" for i in range(len(novel_poses))]
-        ref_image_indices = self.interpolator.find_nearest_assignments(
-            self.parser.camtoworlds[self.trainset.indices], novel_poses
-        )
-        ref_image_paths = [self.parser.image_paths[i] for i in np.array(self.trainset.indices)[ref_image_indices]]
-        
-        # --- 2. Difix 准备 ---
-        print("Moving Difix to GPU...")
-        self.difix.to("cuda")
-        if hasattr(self.difix.vae, "enable_tiling"):
-            self.difix.vae.enable_tiling() # 必须开启，防 VAE 崩溃
-        
-        torch.cuda.empty_cache()
 
-        # --- 3. 循环推理 ---
-        for i in tqdm.trange(len(novel_poses), desc="Fixing artifacts..."):
-            try:
-                image_orig = Image.open(image_paths[i]).convert("RGB")
-                ref_orig = Image.open(ref_image_paths[i]).convert("RGB")
-                
-                # 推理分辨率建议保持在 768x448 左右，给 cuDNN 留出 Buffer
-                infer_w, infer_h = 768, 448 
-                image_resized = image_orig.resize((infer_w, infer_h), Image.LANCZOS)
-                ref_resized = ref_orig.resize((infer_w, infer_h), Image.LANCZOS)
+        if len(self.novelloaders) == 0:
+            ref_image_indices = self.interpolator.find_nearest_assignments(self.parser.camtoworlds[self.trainset.indices], novel_poses)
+            ref_image_paths = [self.parser.image_paths[i] for i in np.array(self.trainset.indices)[ref_image_indices]]
+        else:
+            ref_image_indices = self.interpolator.find_nearest_assignments(self.parser.camtoworlds[self.trainset.indices], novel_poses)
+            ref_image_paths = [self.parser.image_paths[i] for i in np.array(self.trainset.indices)[ref_image_indices]]
+        assert len(image_paths) == len(ref_image_paths) == len(novel_poses)
 
-                with torch.amp.autocast('cuda', enabled=True):
-                    output_image = self.difix(
-                        prompt="remove degradation, high quality, clean car roof", 
-                        image=image_resized, 
-                        ref_image=ref_resized, 
-                        num_inference_steps=1, 
-                        timesteps=[199], 
-                        guidance_scale=0.0
-                    ).images[0]
-
-                output_image = output_image.resize(image_orig.size, Image.LANCZOS)
-                fixed_path = f"{self.render_dir}/novel/{step}/Fixed"
-                os.makedirs(fixed_path, exist_ok=True)
-                output_image.save(f"{fixed_path}/{i:04d}.png")
-
-                del output_image, image_resized, ref_resized
-                torch.cuda.empty_cache()
-
-            except Exception as e:
-                print(f"\n⚠️ Error at index {i}: {e}")
-                continue
-
-        # --- 4. 关键：环境硬重置 ---
-        print("Reconstruction finished. Offloading and Resetting LPIPS...")
-        self.difix.to("cpu")
-        
-        import gc
-        gc.collect()
-        torch.cuda.synchronize()
-        
-        # 核心：物理挪动 LPIPS，强制 PyTorch 重新初始化其内部的卷积句柄
-        self.lpips.to("cpu")
-        torch.cuda.synchronize()
-        self.lpips.to("cuda") 
-        
-        torch.cuda.empty_cache()
-
-        # --- 5. 挂载数据集 ---
+        for i in tqdm.trange(0, len(novel_poses), desc="Fixing artifacts..."):
+            image = Image.open(image_paths[i]).convert("RGB")
+            ref_image = Image.open(ref_image_paths[i]).convert("RGB")
+            output_image = self.difix(prompt="remove degradation", image=image, ref_image=ref_image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
+            output_image = output_image.resize(image.size, Image.LANCZOS)
+            os.makedirs(f"{self.render_dir}/novel/{step}/Fixed", exist_ok=True)
+            output_image.save(f"{self.render_dir}/novel/{step}/Fixed/{i:04d}.png")
+            if ref_image is not None:
+                os.makedirs(f"{self.render_dir}/novel/{step}/Ref", exist_ok=True)
+                ref_image.save(f"{self.render_dir}/novel/{step}/Ref/{i:04d}.png")
+    
         parser = deepcopy(self.parser)
         parser.test_every = 0
         parser.image_paths = [f"{self.render_dir}/novel/{step}/Fixed/{i:04d}.png" for i in range(len(novel_poses))]
@@ -1253,21 +1004,25 @@ class Runner:
         parser.camtoworlds = novel_poses
         parser.camera_ids = [parser.camera_ids[0]] * len(novel_poses)
         
+        print(f"Adding {len(parser.image_paths)} fixed images to novel dataset...")
         dataset = Dataset(parser, split="train")
         dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0, pin_memory=False
+            dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=True,
+            num_workers=0,
+            persistent_workers=True,
+            pin_memory=True,
         )
-        
         self.novelloaders.append(dataloader)
         self.novelloaders_iter.append(iter(dataloader))
+
         self.current_novel_poses = novel_poses
-        
-        print(f"✅ Step {step} reconstruction finished. LPIPS handle refreshed.")
 
     @torch.no_grad()
-    def fix(self, step: int):
+    def fix_able(self, step: int):
         # 1. 环境初始化
-        torch.backends.cudnn.enabled = False
+        torch.backends.cudnn.enabled = True
         print(f"\n🚀 [Reconstruction] Starting at step {step}...")
         
         # 确定推理姿态
@@ -1301,7 +1056,7 @@ class Runner:
                 orig_w, orig_h = image_orig.size 
 
                 # 💡 设为 832x512：进一步降低显存峰值，且符合 VAE 对齐要求
-                infer_w, infer_h = 832, 512 
+                infer_w, infer_h = 512, 256 
                 image_resized = image_orig.resize((infer_w, infer_h), Image.LANCZOS)
                 ref_resized = ref_orig.resize((infer_w, infer_h), Image.LANCZOS)
 
@@ -1359,7 +1114,7 @@ class Runner:
         print(f"Adding {len(parser.image_paths)} fixed images to novel dataset...")
         dataset = Dataset(parser, split="train")
         dataloader = torch.utils.data.DataLoader(
-            dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True
+            dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0, pin_memory=True
         )
         
         self.novelloaders.append(dataloader)
@@ -1378,23 +1133,16 @@ class Runner:
         print(f"\n🚀 [Reconstruction] Starting at step {step}...")
         
         # --- 动态梯度策略控制 ---
-        # 初始抬升 0.1，每轮增加 0.03。例如：第1轮 0.2 -> 第2轮 0.23 -> 第3轮 0.26
-        if self.fix_count % 2 == 0:
-            dynamic_elevation = 0.1 + (self.fix_count // 2) * 0.01
-        else:
-            dynamic_elevation = 0.1 - (self.fix_count // 2) * 0.01
-            
-        # 强制封顶和保底：绝对不看全顶 (0.6) 和全底
-        dynamic_elevation = np.clip(dynamic_elevation, 0.1, 0.35)
+        # 1. 极小范围的上下试探 (在 0.02, 0.04, 0.06 之间循环)
+        # 这样既能修补边缘漏洞，又不会导致模型看到未知的虚空
+        dynamic_elevation = 0.02 + (self.fix_count % 3) * 0.02
         
-        # 2. 距离稍微拉远，保证投影完整
-        dynamic_distance = 0.15 + (self.fix_count * 0.02)
-        dynamic_distance = min(dynamic_distance, 0.4) 
+        # 2. 距离保持贴近，微量拉远以防画面撕裂 (在 0.05 到 0.1 之间波动)
+        dynamic_distance = 0.05 + (self.fix_count % 2) * 0.05
 
-        print(f"📊 [Safe-Strategy] Round: {self.fix_count}, Elevation: {dynamic_elevation:.2f}, Distance: {dynamic_distance:.2f}")
+        print(f"📊 [Micro-Stepping Strategy] Round: {self.fix_count}, Elevation: {dynamic_elevation:.2f}, Distance: {dynamic_distance:.2f}")
 
-        # 确定位姿：始终基于原始位姿进行轻微偏移，而不是基于“上一次修复位姿”递归累加
-        # 递归累加会导致位姿最后漂移到外太空去
+        # 确定位姿：基于原始真实位姿进行微小偏移
         novel_poses = self.interpolator.shift_poses(
             training_poses=self.parser.camtoworlds, 
             testing_poses=self.parser.camtoworlds[self.valset.indices], 
@@ -1402,8 +1150,8 @@ class Runner:
             elevation_amount=dynamic_elevation
         )
         
-        # 更新计数器，供下一轮使用
-        self.fix_count += 1 
+        # 更新计数器
+        self.fix_count += 1
 
         # 渲染当前的轨迹图 (Pred)
         self.render_traj(step, novel_poses)
@@ -1433,7 +1181,7 @@ class Runner:
                 orig_w, orig_h = image_orig.size 
 
                 # 推理分辨率 (降低显存压力)
-                infer_w, infer_h = 832, 512 
+                infer_w, infer_h = 512, 256 
                 image_resized = image_orig.resize((infer_w, infer_h), Image.LANCZOS)
                 ref_resized = ref_orig.resize((infer_w, infer_h), Image.LANCZOS)
 
@@ -1512,6 +1260,163 @@ class Runner:
         # 
         print(f"✅ Step {step} reconstruction completed successfully.")
 
+
+    @torch.no_grad()
+    def fix_zpz_pose_update(self, step: int):
+        # 1. 环境初始化
+        original_cudnn_state = torch.backends.cudnn.enabled
+        torch.backends.cudnn.enabled = False
+        print(f"\n🚀 [Reconstruction] Starting at step {step}...")
+        
+        # --- 动态微步策略控制 (Curriculum Learning) ---
+        # 抛弃之前的大跨度，采用极小角度和极小距离
+        # 每轮只抬高 1~3 度，只后退 0.02~0.06 的距离
+        dynamic_elevation_deg = 1.0 + (self.fix_count % 3) * 1.0  # 1.0, 2.0, 3.0 度循环
+        dynamic_distance = 0.02 + (self.fix_count % 2) * 0.02     # 0.02, 0.04 循环
+
+        print(f"📊 [MACE Strategy] Round: {self.fix_count}, Elevation: {dynamic_elevation_deg:.1f}°, Distance: {dynamic_distance:.2f}")
+
+        # 调用我们科学的流形锚定微调
+        novel_poses = self.interpolator.shift_poses(
+            training_poses=self.parser.camtoworlds, 
+            testing_poses=self.parser.camtoworlds[self.valset.indices], 
+            distance=dynamic_distance, 
+            elevation_deg=dynamic_elevation_deg
+        )
+        
+        # 更新计数器
+        self.fix_count += 1
+
+        # 渲染当前的轨迹图 (Pred)
+        self.render_traj(step, novel_poses)
+        image_paths = [f"{self.render_dir}/novel/{step}/Pred/{i:04d}.png" for i in range(len(novel_poses))]
+
+        # 获取参考图像路径 (找离新位姿最近的训练图)
+        ref_image_indices = self.interpolator.find_nearest_assignments(
+            self.parser.camtoworlds[self.trainset.indices], novel_poses
+        )
+        ref_image_paths = [self.parser.image_paths[i] for i in np.array(self.trainset.indices)[ref_image_indices]]
+        
+        # 2. 显存策略：准备 Difix 模型
+        print("Moving Difix to GPU for high-res fixing...")
+        if hasattr(self.difix.vae, "disable_tiling"):
+            self.difix.vae.disable_tiling()
+        
+        # 如果你之前注释掉了 .to("cuda")，确保现在它是工作的
+        self.difix.to("cuda")
+        torch.cuda.empty_cache()
+
+        # 3. 循环推理 (逐张修复)
+        for i in tqdm.trange(len(novel_poses), desc="Fixing artifacts...in trainer"):
+            try:
+                # 加载图像
+                image_orig = Image.open(image_paths[i]).convert("RGB")
+                ref_orig = Image.open(ref_image_paths[i]).convert("RGB")
+                orig_w, orig_h = image_orig.size 
+
+                # 推理分辨率 (降低显存压力)
+                infer_w, infer_h = 512, 256 
+                image_resized = image_orig.resize((infer_w, infer_h), Image.LANCZOS)
+                ref_resized = ref_orig.resize((infer_w, infer_h), Image.LANCZOS)
+
+                # 使用自动混合精度 (AMP) 推理
+                with torch.cuda.amp.autocast(enabled=True):
+                    output_image = self.difix(
+                        prompt="remove degradation, high quality, clean car roof", 
+                        image=image_resized, 
+                        ref_image=ref_resized, 
+                        num_inference_steps=1, 
+                        timesteps=[199], 
+                        guidance_scale=0.0
+                    ).images[0]
+
+                # 恢复到原始尺寸 (1920x1472)
+                output_image = output_image.resize((orig_w, orig_h), Image.LANCZOS)
+
+                # 保存结果
+                fixed_path = f"{self.render_dir}/novel/{step}/Fixed"
+                ref_path = f"{self.render_dir}/novel/{step}/Ref"
+                os.makedirs(fixed_path, exist_ok=True)
+                os.makedirs(ref_path, exist_ok=True)
+
+                output_image.save(f"{fixed_path}/{i:04d}.png")
+                ref_orig.save(f"{ref_path}/{i:04d}.png")
+
+                # 显存回收
+                del output_image, image_resized, ref_resized, image_orig, ref_orig
+                torch.cuda.empty_cache()
+
+            except torch.OutOfMemoryError:
+                print(f"\n⚠️ OOM at index {i}, clearing cache and skipping...")
+                torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                print(f"\n❌ Error at index {i}: {e}")
+                continue
+
+        # 4. 释放显存：模型卸载到 CPU
+        print("Reconstruction finished. Offloading model and cleaning RAM...")
+        self.difix.to("cpu")
+        
+        # 强制执行垃圾回收，防止被系统 Killed
+        import gc
+        gc.collect()
+        # --- 重点：恢复 cuDNN 状态并强制同步 ---
+        torch.cuda.synchronize()  # 确保所有 Difix 的 GPU 任务彻底结束
+        torch.backends.cudnn.enabled = original_cudnn_state # 恢复成 True
+        
+        # 重新激活 LPIPS 句柄
+        self.lpips.to("cuda")
+        torch.cuda.empty_cache()
+
+        # 5. 挂载新数据集 (鲁棒过滤版)
+        parser = deepcopy(self.parser)
+        parser.test_every = 0
+        
+        valid_image_paths = []
+        valid_image_names = []
+        valid_alpha_paths = []
+        valid_camtoworlds = []
+        valid_camera_ids = []
+
+        # 遍历所有目标位姿，只保留在硬盘上成功生成了的图片
+        for i in range(len(novel_poses)):
+            fixed_img_path = f"{self.render_dir}/novel/{step}/Fixed/{i:04d}.png"
+            if os.path.exists(fixed_img_path):
+                valid_image_paths.append(fixed_img_path)
+                valid_image_names.append(os.path.basename(fixed_img_path))
+                valid_alpha_paths.append(f"{self.render_dir}/novel/{step}/Alpha/{i:04d}.png")
+                valid_camtoworlds.append(novel_poses[i])
+                valid_camera_ids.append(self.parser.camera_ids[0])
+                
+        # 极端情况兜底：如果全部 OOM 导致一张图都没生成出来
+        if len(valid_image_paths) == 0:
+            print(f"⚠️ [Warning] All {len(novel_poses)} images failed to generate at step {step} due to OOM. Skipping dataset addition.")
+            self.current_novel_poses = novel_poses
+            return
+
+        parser.image_paths = valid_image_paths
+        parser.image_names = valid_image_names
+        parser.alpha_mask_paths = valid_alpha_paths
+        parser.camtoworlds = np.array(valid_camtoworlds)
+        parser.camera_ids = valid_camera_ids
+        
+        print(f"Adding {len(parser.image_paths)} successfully fixed images to training set (Skipped {len(novel_poses) - len(parser.image_paths)} due to OOM)...")
+        dataset = Dataset(parser, split="train")
+        
+        # 设置 num_workers=0 以防止多进程内存溢出导致 Killed
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0, pin_memory=False
+        )
+        
+        self.novelloaders.append(dataloader)
+        self.novelloaders_iter.append(iter(dataloader))
+
+        # 记录本次位姿，作为下一轮抬升的基准
+        self.current_novel_poses = novel_poses
+        print(f"✅ Step {step} reconstruction completed successfully.")
+
+
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
         """Entry for evaluation."""
@@ -1549,117 +1454,112 @@ class Runner:
             ellipse_time += time.time() - tic
 
             if masks is not None:
-                # 同样把 GT 的背景涂黑，保证对比的一致性
+                # GT 背景涂黑，保证对比一致性
                 pixels = pixels * masks.unsqueeze(-1).float()
+                # 🔥 修复1：预测图也用 mask 涂黑，保证指标公平！
+                colors = colors * masks.unsqueeze(-1).float()
 
             colors = torch.clamp(colors, 0.0, 1.0)
             canvas_list = [pixels, colors]
 
             if world_rank == 0:
-                # write images
+                # write GT images
                 pixels_path = f"{self.render_dir}/val/{step}/GT/{i:04d}.png"
                 os.makedirs(os.path.dirname(pixels_path), exist_ok=True)
                 pixels_canvas = pixels.squeeze(0).cpu().numpy()
                 pixels_canvas = (pixels_canvas * 255).astype(np.uint8)
                 imageio.imwrite(pixels_path, pixels_canvas)
 
+                # write Pred images
                 colors_path = f"{self.render_dir}/val/{step}/Pred/{i:04d}.png"
                 os.makedirs(os.path.dirname(colors_path), exist_ok=True)
                 colors_canvas = colors.squeeze(0).cpu().numpy()
                 colors_canvas = (colors_canvas * 255).astype(np.uint8)
                 imageio.imwrite(colors_path, colors_canvas)
                 
+                # 🔥 修复2：Alpha 保存逻辑纠正（物体=白色，背景=黑色）
                 alphas_path = f"{self.render_dir}/val/{step}/Alpha/{i:04d}.png"
                 os.makedirs(os.path.dirname(alphas_path), exist_ok=True)
-                alphas_canvas = (alphas < 0.5).squeeze(0).cpu().numpy()
+                alphas_canvas = (alphas > 0.5).squeeze(0).cpu().numpy()  # 这里改对了
                 alphas_canvas = (alphas_canvas * 255).astype(np.uint8)
                 Image.fromarray(alphas_canvas.squeeze(), mode='L').save(alphas_path)
 
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                # metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                # metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                # metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+                # 维度转换 [B, H, W, C] -> [B, C, H, W]
+                pixels_p = pixels.permute(0, 3, 1, 2)
+                colors_p = colors.permute(0, 3, 1, 2)
+
                 # 2. 计算精准的物体级指标 (Object-Centric Metrics)
                 if masks is not None:
-                    # 1. 找到物体的边界（mask 是 [1, H, W]）
-                    mask_indices = torch.where(masks > 0.5)
+                    # 🔥 修复3：squeeze() 去掉多余维度，防止坐标计算错误
+                    mask_squeeze = masks.squeeze(0)  # [H, W]
+                    mask_indices = torch.where(mask_squeeze > 0.5)
                     
+                    # 🔥 修复4：增加空值保护
                     if len(mask_indices[0]) > 0:
-                        # 获取 BBox 坐标
-                        y_min, y_max = mask_indices[1].min(), mask_indices[1].max()
-                        x_min, x_max = mask_indices[2].min(), mask_indices[2].max()
+                        # 获取物体 BBox
+                        y_min, y_max = mask_indices[0].min(), mask_indices[0].max()
+                        x_min, x_max = mask_indices[1].min(), mask_indices[1].max()
                         
-                        # --- 增加 10 像素的 Padding 保护边缘 ---
+                        # 增加 10px padding
                         pad = 10
                         y_min = max(0, y_min - pad)
                         y_max = min(height, y_max + pad)
                         x_min = max(0, x_min - pad)
                         x_max = min(width, x_max + pad)
                         
-                        # 裁剪图像 [1, 3, H, W]
-                        # 切记：obj_pixels 和 obj_colors 必须是基于同一组坐标切出来的
+                        # 裁剪
                         obj_pixels = pixels_p[:, :, y_min:y_max, x_min:x_max]
                         obj_colors = colors_p[:, :, y_min:y_max, x_min:x_max]
                         
-                        # --- 计算物体的真实指标 ---
-                        # 这里的 self.psnr 现在是在小图上算，不需要再手动写 MSE 公式了
+                        # 计算指标
                         metrics["obj_psnr"].append(self.psnr(obj_colors, obj_pixels))
                         metrics["obj_ssim"].append(self.ssim(obj_colors, obj_pixels))
                         
-                        # LPIPS 对尺寸和对齐非常敏感
-                        if obj_pixels.shape[2] < 32 or obj_pixels.shape[3] < 32:
-                            # 如果切出来的车太小，强行 resize 到 224x224
-                            obj_pixels = F.interpolate(obj_pixels, size=(224, 224), mode='bilinear', align_corners=False)
-                            obj_colors = F.interpolate(obj_colors, size=(224, 224), mode='bilinear', align_corners=False)
-                            
-                        # metrics["obj_lpips"].append(self.lpips(obj_colors, obj_pixels))
-                        # --- LPIPS 防爆显存保护 ---
-                        lpips_colors, lpips_pixels = obj_colors, obj_pixels
-                        
-                        # 1. 解决太小的问题 (LPIPS 要求长宽 >= 32)
+                        # LPIPS 安全计算（大小自适应 + 显存保护）
+                        lpips_pixels = obj_pixels
+                        lpips_colors = obj_colors
+
+                        # 最小尺寸限制
                         if lpips_pixels.shape[2] < 32 or lpips_pixels.shape[3] < 32:
                             lpips_pixels = F.interpolate(lpips_pixels, size=(224, 224), mode='bilinear', align_corners=False)
                             lpips_colors = F.interpolate(lpips_colors, size=(224, 224), mode='bilinear', align_corners=False)
-                            
-                        # 2. 解决太大的问题 (防止 VGG16 卷积把显存撑爆，最长边强行限制在 800)
+                        
+                        # 最大尺寸限制
                         max_edge = max(lpips_pixels.shape[2], lpips_pixels.shape[3])
                         if max_edge > 800:
                             scale = 800.0 / max_edge
-                            new_h, new_w = int(lpips_pixels.shape[2] * scale), int(lpips_pixels.shape[3] * scale)
+                            new_h = int(lpips_pixels.shape[2] * scale)
+                            new_w = int(lpips_pixels.shape[3] * scale)
                             lpips_pixels = F.interpolate(lpips_pixels, size=(new_h, new_w), mode='bilinear', align_corners=False)
                             lpips_colors = F.interpolate(lpips_colors, size=(new_h, new_w), mode='bilinear', align_corners=False)
 
-                        # 安全计算 LPIPS
                         metrics["obj_lpips"].append(self.lpips(lpips_colors, lpips_pixels))
+
+                # 颜色校正（如果开启）
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
-                    cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                    cc_colors_p = cc_colors.permute(0, 3, 1, 2)
                     metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
 
         if world_rank == 0:
             ellipse_time /= len(valloader)
-
             stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
-            stats.update(
-                {
-                    "ellipse_time": ellipse_time,
-                    "num_GS": len(self.splats["means"]),
-                }
-            )
+            stats.update({
+                "ellipse_time": ellipse_time,
+                "num_GS": len(self.splats["means"]),
+            })
             print(
-                f"PSNR: {stats['obj_psnr']:.3f}, SSIM: {stats['obj_ssim']:.4f}, LPIPS: {stats['obj_lpips']:.3f} "
-                f"Time: {stats['ellipse_time']:.3f}s/image "
-                f"Number of GS: {stats['num_GS']}"
+                f"===> Evaluation Results <===\n"
+                f"Obj PSNR: {stats['obj_psnr']:.3f} | Obj SSIM: {stats['obj_ssim']:.4f} | Obj LPIPS: {stats['obj_lpips']:.3f}\n"
+                f"Time/image: {stats['ellipse_time']:.3f}s | GS Count: {stats['num_GS']}"
             )
-            # save stats as json
+            # 保存 json + tensorboard
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
                 json.dump(stats, f)
-            # save stats to tensorboard
             for k, v in stats.items():
                 self.writer.add_scalar(f"{stage}/{k}", v, step)
             self.writer.flush()
-
+        
     @torch.no_grad()
     def render_traj(self, step: int, camtoworlds_all=None, batch_size=8, tag="novel"):
         """Entry for trajectory rendering."""
@@ -1737,76 +1637,168 @@ class Runner:
                 Image.fromarray(alphas_canvas.squeeze(), mode='L').save(alphas_path)
 
     @torch.no_grad()
-    def render_final_video(self, tag="final_eval"):
-        """在训练的最后一步，渲染全量训练+测试位姿，生成终极对比视频"""
-        print(f"\n🎬 [Final Stage] Rendering all original poses and generating comparison video...")
+    def render_final_video(self, step: int, tag="final_eval"):
+        """
+        ✅ 三列对比：GT | GT+MASK | PRED
+        ✅ 100% 匹配你的代码，无任何维度/类型错误
+        """
+        print(f"\n🎬 [Final Stage] Generating 3-Column Comparison Video (GT | GT-MASK | PRED)")
+        import numpy as np
+        import imageio
+        from PIL import Image
+        import os
+        import tqdm
+
         cfg = self.cfg
         device = self.device
-        
-        # 1. 提取全量真实位姿 (训练集+测试集全上)
-        camtoworlds_all = self.parser.camtoworlds
-        camtoworlds_all_tensor = torch.from_numpy(camtoworlds_all).float().to(device)
-        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+
+        evalset = self.trainset
         width, height = list(self.parser.imsize_dict.values())[0]
-        
-        batch_size = 8
-        frames_for_video = []
-        
-        # 结果存放在 renders/final_eval/ 下面
+        K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
+
+        frames = []
         out_dir = f"{self.render_dir}/{tag}"
+        os.makedirs(f"{out_dir}/Compare", exist_ok=True)
 
-        for i in tqdm.trange(0, len(camtoworlds_all_tensor), batch_size, desc="Rendering Final Video"):
-            camtoworlds = camtoworlds_all_tensor[i : i + batch_size]
-            Ks = K[None].repeat(camtoworlds.shape[0], 1, 1)
+        for global_idx in tqdm.trange(len(evalset), desc="Rendering"):
+            data = evalset[global_idx]
+            camtoworld = data["camtoworld"].to(device).unsqueeze(0)
+            Ks = K.unsqueeze(0)
 
-            renders, alphas, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds, Ks=Ks, width=width, height=height,
-                sh_degree=cfg.sh_degree, near_plane=cfg.near_plane, far_plane=cfg.far_plane,
-                render_mode="RGB+ED",
+            # 渲染预测图
+            renders, _, _ = self.rasterize_splats(
+                camtoworlds=camtoworld,
+                Ks=Ks,
+                width=width,
+                height=height,
+                sh_degree=cfg.sh_degree,
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
             )
 
-            for j in range(renders.shape[0]):
-                idx = i + j
-                
-                # --- 获取 Pred ---
-                colors = torch.clamp(renders[j, ..., 0:3], 0.0, 1.0)
-                pred_canvas = (colors.cpu().numpy() * 255).astype(np.uint8)
-                
-                # --- 获取真实 GT ---
-                # 因为跑的是官方原位姿，所以绝对能在 self.parser.images 里找到真实的图片
-                gt_canvas = self.parser.images[idx]
-                
-                # (可选) 如果你希望 GT 图片的背景也是黑的（应用 mask），可以取消下面两行的注释：
-                # if hasattr(self.parser, "masks") and self.parser.masks is not None:
-                #     gt_canvas = gt_canvas * self.parser.masks[idx][..., None]
+            # ==========================
+            # 1. 预测图 PRED (正确格式)
+            # ==========================
+            pred = torch.clamp(renders[0, ..., :3], 0.0, 1.0).cpu().numpy()
+            pred_np = (pred * 255).astype(np.uint8)
 
-                # --- 左右拼接生成 Compare ---
-                compare_canvas = np.concatenate([gt_canvas, pred_canvas], axis=1)
-                frames_for_video.append(compare_canvas)
+            # ==========================
+            # 2. GT 原图 (正确格式)
+            # ==========================
+            gt = data["image"].numpy()  # [H, W, 3] 0-255 uint8
+            gt_np = gt.astype(np.uint8)
 
-                # --- 分别保存三个文件夹 ---
-                # 1. Pred
-                pred_path = f"{out_dir}/Pred/{idx:04d}.png"
-                os.makedirs(os.path.dirname(pred_path), exist_ok=True)
-                imageio.imwrite(pred_path, pred_canvas)
-                
-                # 2. GT
-                gt_path = f"{out_dir}/GT/{idx:04d}.png"
-                os.makedirs(os.path.dirname(gt_path), exist_ok=True)
-                imageio.imwrite(gt_path, gt_canvas)
-                
-                # 3. Compare
-                compare_path = f"{out_dir}/Compare/{idx:04d}.png"
-                os.makedirs(os.path.dirname(compare_path), exist_ok=True)
-                imageio.imwrite(compare_path, compare_canvas)
+            # ==========================
+            # 3. GT * MASK（你要的核心！）
+            # ==========================
+            mask = data["mask"].numpy()  # [H, W] True/False
+            mask_np = mask.astype(np.float32)
+            gt_masked = (gt_np * mask_np[..., None]).clip(0, 255).astype(np.uint8)
+            pred_np = (pred_np * mask_np[..., None]).clip(0, 255).astype(np.uint8)
+            # ==========================
+            # 4. 三列拼接
+            # ==========================
+            compare_frame = np.hstack([gt_np, gt_masked, pred_np])
+            frames.append(compare_frame)
 
-        # --- 合成最终 MP4 视频 ---
-        if len(frames_for_video) > 0:
-            video_path = f"{out_dir}/final_comparison_video.mp4"
-            print(f"🎥 正在合成终极全景对比视频: {video_path}")
-            # fps 设置为 24 保证流畅度
-            imageio.mimwrite(video_path, frames_for_video, fps=24, quality=8)
-            print("✅ 终极视频生成完毕！快去查看吧！")
+            # 保存单帧
+            imageio.imwrite(f"{out_dir}/Compare/{global_idx:04d}.png", compare_frame)
+
+        # 保存视频
+        if len(frames) > 0:
+            video_path = f"{out_dir}/final_{step}.mp4"
+            imageio.mimwrite(video_path, frames, fps=15, quality=9)
+            print(f"✅ 视频已保存: {video_path}")
+
+    @torch.no_grad()
+    def filter_external_gs(self, data, info, step):
+        if "mask" not in data or data["mask"] is None:
+            return
+
+        device = self.device
+
+        # 1. 预处理 Mask: 确保是 [H, W]
+        mask = data["mask"].to(device).squeeze()
+        if mask.dim() > 2:
+            mask = mask[0]
+        H, W = mask.shape
+
+        # 2. 获取并修正 means2d 维度 [N, 2]
+        means2d = info["means2d"]
+        if means2d.dim() == 3:
+            means2d = means2d.squeeze(0)
+
+        n_total = means2d.shape[0]
+
+        # 3. 坐标转换与视口判定
+        u = means2d[:, 0].long()
+        v = means2d[:, 1].long()
+
+        in_view_mask = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+
+        # 4. 判定背景点
+        external_mask = torch.zeros(n_total, dtype=torch.bool, device=device)
+
+        if in_view_mask.any():
+            in_view_indices = torch.where(in_view_mask)[0]
+            # 直接索引 Mask (注意 [row, col] -> [v, u])
+            sampled_values = mask[v[in_view_mask], u[in_view_mask]]
+            is_background = sampled_values < 0.5
+            external_mask[in_view_indices[is_background]] = True
+
+        n_filter = external_mask.sum().item()
+
+        # --- DEBUG 打印 ---
+        if self.world_rank == 0:
+            print(
+                f"[Step {step}] View Stats: Total GS={n_total}, In-View={in_view_mask.sum().item()}, External={int(n_filter)}"
+            )
+
+        if n_filter == 0:
+            return
+
+        # 5. 执行操作
+        if isinstance(self.cfg.strategy, DefaultStrategy):
+            from gsplat.strategy.default import remove
+
+            remove(
+                params=self.splats,
+                optimizers=self.optimizers,
+                state=self.strategy_state,
+                mask=external_mask,
+            )
+        elif isinstance(self.cfg.strategy, MCMCStrategy):
+            from gsplat.strategy.mcmc import relocate
+
+            # --- 核心修复：确保 binoms 在 CUDA 上 ---
+            binoms = self.strategy_state["binoms"].to(device)
+
+            relocate(
+                params=self.splats,
+                optimizers=self.optimizers,
+                state={},
+                mask=external_mask,
+                binoms=binoms,
+                min_opacity=self.cfg.strategy.min_opacity,
+            )
+
+        if self.world_rank == 0:
+            print(f"[Step {step}] Mask Filter: {int(n_filter)} GSs processed.")
+
+    def compute_tv_loss(self, image):
+        """
+        计算图像的全变分损失
+        image shape: [1, H, W, 1] (Alpha图) 或 [1, H, W, 3] (Color图)
+        """
+        # 计算水平方向和垂直方向相邻像素的差值
+        # tv_h: 第 i 行和第 i+1 行的差
+        tv_h = torch.abs(image[:, 1:, :, :] - image[:, :-1, :, :]).sum()
+        # tv_w: 第 j 列和第 j+1 列的差
+        tv_w = torch.abs(image[:, :, 1:, :] - image[:, :, :-1, :]).sum()
+
+        # 返回平均值，防止图片分辨率不同导致 Loss 量级爆炸
+        return (tv_h + tv_w) / image.numel()
+
 
     @torch.no_grad()
     def run_compression(self, step: int):
@@ -1885,12 +1877,6 @@ if __name__ == "__main__":
     CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
 
     """
-
-
-    # import debugpy
-    # debugpy.listen(("0.0.0.0", 5678))
-    # print("🛸 调试器已就绪，正在等待 VS Code 连接...")
-    # debugpy.wait_for_client()
 
     # Config objects we can choose between.
     # Each is a tuple of (CLI description, config object).

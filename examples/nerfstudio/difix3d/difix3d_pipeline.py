@@ -33,7 +33,7 @@ from difix3d.difix3d_datamanager import (
     Difix3DDataManagerConfig,
 )
 from src.pipeline_difix import DifixPipeline
-from Difix3D.examples.utils_zpz import CameraPoseInterpolator
+from Difix3D.examples.utils_old import CameraPoseInterpolator
 
 
 @dataclass

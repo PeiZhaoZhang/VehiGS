@@ -73,7 +73,7 @@ from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat.optimizers import SelectiveAdam
 from gsplat import export_splats
-from Difix3D.examples.utils_zpz import CameraPoseInterpolator
+from Difix3D.examples.utils_old import CameraPoseInterpolator
 from src.pipeline_difix import DifixPipeline
 
 

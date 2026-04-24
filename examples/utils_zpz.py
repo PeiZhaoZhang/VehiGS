@@ -37,77 +37,69 @@ class CameraPoseInterpolator:
         q_interp = q_interp / np.linalg.norm(q_interp)
         return Rotation.from_quat(q_interp).as_matrix()
 
-    # ================================================================
-    # 核心可调接口
+# ================================================================
+    # 核心创新点二：流形锚定的局部微步探索 (MACE / LTMS)
     # ================================================================
     def shift_poses(self, 
                     training_poses, 
                     testing_poses, 
-                    distance=0.0, 
-                    elevation_amount=0.4, 
-                    center_offset=None,
-                    up_axis_manual=None):
+                    distance=0.03,        # 极其微小的后退距离
+                    elevation_deg=2.0,    # 极其微小的仰角变化 (度)
+                    **kwargs): 
         """
-        Args:
-            training_poses: 原始训练位姿
-            testing_poses: 原始测试位姿
-            distance: [调节远近] 正数远离车，负数靠近车 (建议范围: -0.5 ~ 1.0)
-            elevation_amount: [调节高度] 0.0是在地面，1.0是正上方 (建议范围: 0.3 ~ 0.6)
-            center_offset: [中心微调] 如果发现车不在画面中心，输入 [x, y, z] 进行偏移
-            up_axis_manual: [强制坐标轴] 如果车还是歪的，可以手动指定如 [0, 0, 1]
+        基于局部切线空间的微步生成策略 (Local-Tangent Micro-Stepping)。
+        完全摒弃全局中心，沿着相机自身的局部坐标轴进行平移和俯仰旋转，
+        确保视锥体始终稳定锁定在已知的流形表面上，为扩散模型提供强有力的局部先验约束。
         """
-        
-        # 1. 确定车辆中心 (Look-at Target)
-        center = np.mean(training_poses[:, :3, 3], axis=0)
-        if center_offset is not None:
-            center += np.array(center_offset)
-            
-        # 2. 自动提取“世界向上”向量 (自适应不同数据集)
-        if up_axis_manual is not None:
-            avg_up = np.array(up_axis_manual)
-        else:
-            # 假设 Y 轴平均指向下方，反方向为上 (适配手持数据)
-            avg_up = -np.mean(training_poses[:, :3, 1], axis=0) 
-            
-        avg_up /= (np.linalg.norm(avg_up) + 1e-8)
-        
+        import scipy.spatial.transform as transform
+        import numpy as np
+
         assignments = self.find_nearest_assignments(training_poses, testing_poses)
         novel_poses = []
 
+        # 将角度转换为弧度
+        elevation_rad = np.deg2rad(elevation_deg)
+
         for test_idx, train_idx in enumerate(assignments):
+            # 提取锚点相机的真实位姿
             train_pose = training_poses[train_idx]
-            curr_pos = train_pose[:3, 3]
+            R_orig = train_pose[:3, :3]
+            t_orig = train_pose[:3, 3]
             
-            # 3. 球面投影逻辑
-            vec = curr_pos - center
-            dist = np.linalg.norm(vec)
-            radial_dir = vec / (dist + 1e-8)
+            # 在 COLMAP/OpenCV 相机坐标系中：
+            # X轴: 向右 (R_orig[:, 0])
+            # Y轴: 向下 (R_orig[:, 1])
+            # Z轴: 向前/镜头方向 (R_orig[:, 2])
             
-            # 抬升：在“径向”和“向上”之间插值
-            new_dir = (1 - elevation_amount) * radial_dir + elevation_amount * avg_up
-            new_dir /= np.linalg.norm(new_dir)
+            # ----------------------------------------------------
+            # 步骤 1: 局部俯仰旋转 (Pitch)
+            # 我们让相机围绕自己的 X 轴(局部右方向)进行微小的俯仰旋转
+            # 这样可以在不改变目标物体在画面中心的情况下，看到更多车顶
+            # ----------------------------------------------------
+            # 构建一个只绕 X 轴旋转的局部旋转矩阵
+            pitch_matrix = transform.Rotation.from_euler('x', -elevation_rad).as_matrix()
+            # 将局部旋转叠加到全局旋转上 (矩阵右乘)
+            R_new = R_orig @ pitch_matrix
             
-            # 计算新位置
-            new_t = center + new_dir * (dist + distance)
+            # ----------------------------------------------------
+            # 步骤 2: 沿新视轴微量后退 (Translation along new Z)
+            # 旋转后，我们沿着新的镜头方向往后退一点，确保画面边缘留出修补空间
+            # ----------------------------------------------------
+            cam_forward_new = R_new[:, 2] # 新的镜头前方向
+            cam_up_new = -R_new[:, 1]     # 新的相机上方
+            
+            # 后退一点点 (沿着 -Z)
+            t_new = t_orig - distance * cam_forward_new
+            # 为了防止后退导致底部穿帮，可以配合极其微小的高度补偿
+            t_new = t_new + (distance * 0.2) * cam_up_new
 
-            # 4. 构建 Look-at 矩阵 (决定相机怎么看车)
-            f = center - new_t  # 前方向 (Z)
-            f /= (np.linalg.norm(f) + 1e-8)
-            
-            r = np.cross(f, avg_up)  # 右方向 (X)
-            if np.linalg.norm(r) < 1e-6:
-                r = np.array([1.0, 0.0, 0.0])
-            r /= np.linalg.norm(r)
-            
-            u = np.cross(r, f)  # 上方向 (Y)
-            
-            # 组合成旋转矩阵 (适配 OpenCV 风格渲染器)
-            # 如果画面依然是倒的，把 -u 改成 u
-            R_new = np.stack([r, -u, f], axis=1) 
-
+            # ----------------------------------------------------
+            # 步骤 3: 合成最终的新视角流形位姿
+            # ----------------------------------------------------
             new_pose = np.eye(4)
             new_pose[:3, :3] = R_new
-            new_pose[:3, 3] = new_t
+            new_pose[:3, 3] = t_new
+            
             novel_poses.append(new_pose)
 
         return np.array(novel_poses)
