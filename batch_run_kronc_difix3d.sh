@@ -8,9 +8,9 @@ export PYTHONPATH=$PYTHONPATH:/root/project
 UCO3D_ROOT="/root/project/data/KRONC"  # 请根据实际情况修改路径，确保它指向包含所有场景的父目录
 
 # 4. 公共参数
-RESULT_TAG="recon_difix3d_kronc_v3_mask_ref"
+RESULT_TAG="recon_difix3d_kronc_v4_fix_sized"  # 输出文件夹名
 DATA_FACTOR=1
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 export CUDA_LAUNCH_BLOCKING=1
 
 # 5. 全自动搜索所有已经预处理好的序列

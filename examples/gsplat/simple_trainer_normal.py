@@ -944,9 +944,9 @@ class Runner:
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
 
-            # run fixer
+            # # run fixer
             # if step in [i - 1 for i in cfg.fix_steps]:
-            #     self.fix_zpz_pose_update(step)
+            #     self.fix_zpz_final_sized(step)
 
             if step in [i - 1 for i in cfg.render_steps]:
                 self.render_final_video(step)
@@ -1260,28 +1260,23 @@ class Runner:
         # 
         print(f"✅ Step {step} reconstruction completed successfully.")
 
-
     @torch.no_grad()
-    def fix_zpz_pose_update(self, step: int):
+    def fix_zpz_final(self, step: int): 
         # 1. 环境初始化
         original_cudnn_state = torch.backends.cudnn.enabled
         torch.backends.cudnn.enabled = False
         print(f"\n🚀 [Reconstruction] Starting at step {step}...")
         
-        # --- 动态微步策略控制 (Curriculum Learning) ---
-        # 抛弃之前的大跨度，采用极小角度和极小距离
-        # 每轮只抬高 1~3 度，只后退 0.02~0.06 的距离
-        dynamic_elevation_deg = 1.0 + (self.fix_count % 3) * 1.0  # 1.0, 2.0, 3.0 度循环
-        dynamic_distance = 0.02 + (self.fix_count % 2) * 0.02     # 0.02, 0.04 循环
+        # --- 渐进式插值策略 (Progressive Interpolation) ---
+        dynamic_distance = 0.02 + (self.fix_count % 3) * 0.02  # 0.02, 0.04, 0.06 循环试探
 
-        print(f"📊 [MACE Strategy] Round: {self.fix_count}, Elevation: {dynamic_elevation_deg:.1f}°, Distance: {dynamic_distance:.2f}")
+        print(f"📊 [Interpolation Strategy] Round: {self.fix_count}, Distance: {dynamic_distance:.2f}")
 
-        # 调用我们科学的流形锚定微调
+        # 调用恢复后的官方插值微调
         novel_poses = self.interpolator.shift_poses(
-            training_poses=self.parser.camtoworlds, 
+            training_poses=self.parser.camtoworlds[self.trainset.indices], 
             testing_poses=self.parser.camtoworlds[self.valset.indices], 
-            distance=dynamic_distance, 
-            elevation_deg=dynamic_elevation_deg
+            distance=dynamic_distance
         )
         
         # 更新计数器
@@ -1295,24 +1290,50 @@ class Runner:
         ref_image_indices = self.interpolator.find_nearest_assignments(
             self.parser.camtoworlds[self.trainset.indices], novel_poses
         )
-        ref_image_paths = [self.parser.image_paths[i] for i in np.array(self.trainset.indices)[ref_image_indices]]
+        actual_ref_indices = np.array(self.trainset.indices)[ref_image_indices]
+        ref_image_paths = [self.parser.image_paths[i] for i in actual_ref_indices]
+        
+        # ⚠️ 注意：这里已经删除了 ref_mask_paths 的获取逻辑，从源头杜绝 NoneType 报错！
         
         # 2. 显存策略：准备 Difix 模型
         print("Moving Difix to GPU for high-res fixing...")
         if hasattr(self.difix.vae, "disable_tiling"):
             self.difix.vae.disable_tiling()
         
-        # 如果你之前注释掉了 .to("cuda")，确保现在它是工作的
         self.difix.to("cuda")
         torch.cuda.empty_cache()
 
         # 3. 循环推理 (逐张修复)
         for i in tqdm.trange(len(novel_poses), desc="Fixing artifacts...in trainer"):
             try:
-                # 加载图像
+                # 加载当前视角图
                 image_orig = Image.open(image_paths[i]).convert("RGB")
-                ref_orig = Image.open(ref_image_paths[i]).convert("RGB")
                 orig_w, orig_h = image_orig.size 
+
+                # 加载参考图
+                ref_orig = Image.open(ref_image_paths[i]).convert("RGB")
+                ref_np = np.array(ref_orig)
+                ref_h, ref_w = ref_np.shape[:2]  # 👇 抓取参考图的真实物理尺寸！
+                
+                # =========================================================
+                # 🛡️ 核心修复一：从内存 trainset 拿 GT Mask，为参考图去背！
+                # =========================================================
+                dataset_idx = ref_image_indices[i] # 刚好对应 trainset 的下标
+                dataset_item = self.trainset[dataset_idx]
+
+                if "mask" in dataset_item and dataset_item["mask"] is not None:
+                    mask_tensor = dataset_item["mask"]  # [H, W] Tensor
+                    mask_np = mask_tensor.cpu().numpy().astype(np.float32)
+
+                    # 👇 关键修复：强制把 Mask 拉伸对齐到参考图的尺寸 (解决 1920 vs 1919)
+                    if mask_np.shape[0] != ref_h or mask_np.shape[1] != ref_w:
+                        import cv2
+                        mask_np = cv2.resize(mask_np, (ref_w, ref_h), interpolation=cv2.INTER_NEAREST)
+
+                    # 乘上 Mask，参考图的背景立刻变纯黑，杜绝大楼特征注入！
+                    ref_masked_np = (ref_np * mask_np[..., None]).astype(np.uint8)
+                    ref_orig = Image.fromarray(ref_masked_np)
+                # =========================================================
 
                 # 推理分辨率 (降低显存压力)
                 infer_w, infer_h = 512, 256 
@@ -1320,9 +1341,10 @@ class Runner:
                 ref_resized = ref_orig.resize((infer_w, infer_h), Image.LANCZOS)
 
                 # 使用自动混合精度 (AMP) 推理
-                with torch.cuda.amp.autocast(enabled=True):
+                with torch.amp.autocast('cuda', enabled=True):
                     output_image = self.difix(
-                        prompt="remove degradation, high quality, clean car roof", 
+                        prompt="remove degradation, high quality, clean car body, solid background", 
+                        negative_prompt="buildings, shadows, artifacts, background objects, noise",
                         image=image_resized, 
                         ref_image=ref_resized, 
                         num_inference_steps=1, 
@@ -1330,8 +1352,27 @@ class Runner:
                         guidance_scale=0.0
                     ).images[0]
 
-                # 恢复到原始尺寸 (1920x1472)
+                # 恢复到原始尺寸
                 output_image = output_image.resize((orig_w, orig_h), Image.LANCZOS)
+
+                # =========================================================
+                # 🛡️ 核心修复二：形态学膨胀掩码过滤 (事后清理新视角的残留虚影)
+                # =========================================================
+                import cv2
+                # 读取当前视角 3DGS 渲染出来的 Alpha 掩码 (纯黑白)
+                alpha_path = f"{self.render_dir}/novel/{step}/Alpha/{i:04d}.png"
+                alpha_img = np.array(Image.open(alpha_path).convert("L"))
+
+                # 设定膨胀核，向外围扩张大约 20 像素
+                kernel = np.ones((20, 20), np.uint8) 
+                dilated_alpha = cv2.dilate(alpha_img, kernel, iterations=2)
+                
+                dilated_alpha_pil = Image.fromarray(dilated_alpha).resize((orig_w, orig_h), Image.LANCZOS)
+                clean_bg = Image.new("RGB", (orig_w, orig_h), (0, 0, 0))
+                
+                # 用膨胀掩码将车体抠出，强行贴到纯黑背景上！
+                output_image = Image.composite(output_image, clean_bg, dilated_alpha_pil)
+                # =========================================================
 
                 # 保存结果
                 fixed_path = f"{self.render_dir}/novel/{step}/Fixed"
@@ -1343,7 +1384,7 @@ class Runner:
                 ref_orig.save(f"{ref_path}/{i:04d}.png")
 
                 # 显存回收
-                del output_image, image_resized, ref_resized, image_orig, ref_orig
+                del output_image, image_resized, ref_resized, image_orig, ref_orig, clean_bg, dilated_alpha_pil
                 torch.cuda.empty_cache()
 
             except torch.OutOfMemoryError:
@@ -1358,14 +1399,219 @@ class Runner:
         print("Reconstruction finished. Offloading model and cleaning RAM...")
         self.difix.to("cpu")
         
-        # 强制执行垃圾回收，防止被系统 Killed
         import gc
         gc.collect()
-        # --- 重点：恢复 cuDNN 状态并强制同步 ---
-        torch.cuda.synchronize()  # 确保所有 Difix 的 GPU 任务彻底结束
-        torch.backends.cudnn.enabled = original_cudnn_state # 恢复成 True
+        torch.cuda.synchronize()  
+        torch.backends.cudnn.enabled = original_cudnn_state 
         
-        # 重新激活 LPIPS 句柄
+        self.lpips.to("cuda")
+        torch.cuda.empty_cache()
+
+        # 5. 挂载新数据集 (鲁棒过滤版，只加载成功生成的图)
+        parser = deepcopy(self.parser)
+        parser.test_every = 0
+        
+        valid_image_paths = []
+        valid_image_names = []
+        valid_alpha_paths = []
+        valid_camtoworlds = []
+        valid_camera_ids = []
+
+        for i in range(len(novel_poses)):
+            fixed_img_path = f"{self.render_dir}/novel/{step}/Fixed/{i:04d}.png"
+            if os.path.exists(fixed_img_path):
+                valid_image_paths.append(fixed_img_path)
+                valid_image_names.append(os.path.basename(fixed_img_path))
+                valid_alpha_paths.append(f"{self.render_dir}/novel/{step}/Alpha/{i:04d}.png")
+                valid_camtoworlds.append(novel_poses[i])
+                valid_camera_ids.append(self.parser.camera_ids[0])
+                
+        if len(valid_image_paths) == 0:
+            print(f"⚠️ [Warning] All {len(novel_poses)} images failed at step {step}. Skipping dataset addition.")
+            self.current_novel_poses = novel_poses
+            return
+
+        parser.image_paths = valid_image_paths
+        parser.image_names = valid_image_names
+        parser.alpha_mask_paths = valid_alpha_paths
+        parser.camtoworlds = np.array(valid_camtoworlds)
+        parser.camera_ids = valid_camera_ids
+        
+        print(f"Adding {len(parser.image_paths)} successfully fixed images to training set...")
+        dataset = Dataset(parser, split="train")
+        
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0, pin_memory=False
+        )
+        
+        self.novelloaders.append(dataloader)
+        self.novelloaders_iter.append(iter(dataloader))
+
+        self.current_novel_poses = novel_poses
+        print(f"✅ Step {step} reconstruction completed successfully.")
+
+    @torch.no_grad()
+    def fix_zpz_final_sized(self, step: int): 
+        # 1. 环境初始化
+        original_cudnn_state = torch.backends.cudnn.enabled
+        torch.backends.cudnn.enabled = False
+        print(f"\n🚀 [Reconstruction] Starting at step {step}...")
+        
+        # --- 渐进式插值策略 (Progressive Interpolation) ---
+        dynamic_distance = 0.02 + (self.fix_count % 3) * 0.02  # 0.02, 0.04, 0.06 循环试探
+        print(f"📊 [Interpolation Strategy] Round: {self.fix_count}, Distance: {dynamic_distance:.2f}")
+
+        # 调用插值微调，安全生成新位姿
+        novel_poses = self.interpolator.shift_poses(
+            training_poses=self.parser.camtoworlds[self.trainset.indices], 
+            testing_poses=self.parser.camtoworlds[self.valset.indices], 
+            distance=dynamic_distance
+        )
+        
+        # 更新计数器
+        self.fix_count += 1
+
+        # 渲染当前的轨迹图 (Pred)
+        self.render_traj(step, novel_poses)
+        image_paths = [f"{self.render_dir}/novel/{step}/Pred/{i:04d}.png" for i in range(len(novel_poses))]
+
+        # 获取参考图像路径 (找离新位姿最近的训练图)
+        ref_image_indices = self.interpolator.find_nearest_assignments(
+            self.parser.camtoworlds[self.trainset.indices], novel_poses
+        )
+        actual_ref_indices = np.array(self.trainset.indices)[ref_image_indices]
+        ref_image_paths = [self.parser.image_paths[i] for i in actual_ref_indices]
+        
+        # 2. 显存策略：准备 Difix 模型
+        print("Moving Difix to GPU for high-res fixing...")
+        if hasattr(self.difix.vae, "disable_tiling"):
+            self.difix.vae.disable_tiling()
+        
+        self.difix.to("cuda")
+        torch.cuda.empty_cache()
+
+        # 3. 循环推理 (逐张修复)
+        import cv2  # 提前导入，避免循环里反复报错
+        for i in tqdm.trange(len(novel_poses), desc="Fixing artifacts...in trainer"):
+            try:
+                # =========================================================
+                # 🖼️ 1. 读取原图与参考图
+                # =========================================================
+                image_orig = Image.open(image_paths[i]).convert("RGB")
+                orig_w, orig_h = image_orig.size 
+
+                ref_orig = Image.open(ref_image_paths[i]).convert("RGB")
+                ref_np = np.array(ref_orig)
+                ref_h, ref_w = ref_np.shape[:2]  # 获取参考图真实物理尺寸
+
+                # =========================================================
+                # 🛡️ 2. 参考图完美去背 (杜绝大楼幻觉注入)
+                # =========================================================
+                dataset_idx = ref_image_indices[i] # 对应 trainset 的下标
+                dataset_item = self.trainset[dataset_idx]
+
+                if "mask" in dataset_item and dataset_item["mask"] is not None:
+                    mask_tensor = dataset_item["mask"]  # [H, W] Tensor
+                    mask_np = mask_tensor.cpu().numpy().astype(np.float32)
+
+                    # 强制拉伸对齐到参考图的尺寸
+                    if mask_np.shape[0] != ref_h or mask_np.shape[1] != ref_w:
+                        mask_np = cv2.resize(mask_np, (ref_w, ref_h), interpolation=cv2.INTER_NEAREST)
+
+                    # 乘上 Mask，参考图的背景立刻变纯黑
+                    ref_masked_np = (ref_np * mask_np[..., None]).astype(np.uint8)
+                    ref_orig = Image.fromarray(ref_masked_np)
+
+                # 📐 3. 动态高分辨率控制 (按长边限制，完美兼容横竖屏)
+                # =========================================================
+                max_dim = 1024  # 限制整张图最长的那条边 (如果 OOM 可以调为 896)
+                
+                # 找到原图的“长边”
+                current_max = max(orig_w, orig_h)
+                
+                # 按照长边来计算等比例缩放系数
+                scale_ratio = max_dim / current_max
+                
+                infer_w = int(orig_w * scale_ratio)
+                infer_h = int(orig_h * scale_ratio)
+                
+                # 强制对齐到 8 的整数倍 (Diffusion VAE 的硬性要求)
+                infer_w = (infer_w // 8) * 8
+                infer_h = (infer_h // 8) * 8
+                
+                if i == 0:
+                    print(f"\n  [Resolution] Original: {orig_w}x{orig_h} -> Inference: {infer_w}x{infer_h}")
+
+                image_resized = image_orig.resize((infer_w, infer_h), Image.LANCZOS)
+                ref_resized = ref_orig.resize((infer_w, infer_h), Image.LANCZOS)
+                # =========================================================
+
+                # =========================================================
+                # 🧠 4. 大模型高维修复 (整车全部使用扩散结果)
+                # =========================================================
+                with torch.amp.autocast('cuda', enabled=True):
+                    output_image = self.difix(
+                        prompt="remove degradation, high quality, clean car body, solid background", 
+                        negative_prompt="buildings, shadows, artifacts, background objects, noise",
+                        image=image_resized, 
+                        ref_image=ref_resized, 
+                        num_inference_steps=1, 
+                        timesteps=[199], 
+                        guidance_scale=0.0
+                    ).images[0]
+
+                # 恢复到原始 1080p 尺寸
+                output_image = output_image.resize((orig_w, orig_h), Image.LANCZOS)
+
+                # =========================================================
+                # 🛡️ 5. 整车保留 + 纯净背景切除 (不用中心替换了)
+                # =========================================================
+                alpha_path = f"{self.render_dir}/novel/{step}/Alpha/{i:04d}.png"
+                alpha_img = np.array(Image.open(alpha_path).convert("L"))
+
+                # 提取“安全外部边界”：向外膨胀。车身本身（包含字迹和边缘）100% 保持扩散模型的样子
+                dilate_kernel = np.ones((20, 20), np.uint8) 
+                dilated_alpha = cv2.dilate(alpha_img, dilate_kernel, iterations=2)
+                dilated_alpha_pil = Image.fromarray(dilated_alpha).resize((orig_w, orig_h), Image.LANCZOS)
+                
+                clean_bg = Image.new("RGB", (orig_w, orig_h), (0, 0, 0))
+                
+                # 直接将 Difix 生成的整车，咔嚓切掉外围背景，贴到纯黑布景上
+                output_image = Image.composite(output_image, clean_bg, dilated_alpha_pil)
+
+                # =========================================================
+                # 💾 6. 结果保存与清理
+                # =========================================================
+                fixed_path = f"{self.render_dir}/novel/{step}/Fixed"
+                ref_path = f"{self.render_dir}/novel/{step}/Ref"
+                os.makedirs(fixed_path, exist_ok=True)
+                os.makedirs(ref_path, exist_ok=True)
+
+                output_image.save(f"{fixed_path}/{i:04d}.png")
+                ref_orig.save(f"{ref_path}/{i:04d}.png")
+
+                del output_image, image_resized, ref_resized, image_orig, ref_orig, clean_bg, dilated_alpha_pil
+                torch.cuda.empty_cache()
+
+            except torch.OutOfMemoryError:
+                print(f"\n⚠️ OOM at index {i}, clearing cache and skipping...")
+                torch.cuda.empty_cache()
+                continue
+            except Exception as e:
+                import traceback
+                print(f"\n❌ Error at index {i}: {e}")
+                traceback.print_exc()
+                continue
+
+        # 4. 释放显存：模型卸载到 CPU
+        print("Reconstruction finished. Offloading model and cleaning RAM...")
+        self.difix.to("cpu")
+        
+        import gc
+        gc.collect()
+        torch.cuda.synchronize()  
+        torch.backends.cudnn.enabled = original_cudnn_state 
+        
         self.lpips.to("cuda")
         torch.cuda.empty_cache()
 
@@ -1379,7 +1625,6 @@ class Runner:
         valid_camtoworlds = []
         valid_camera_ids = []
 
-        # 遍历所有目标位姿，只保留在硬盘上成功生成了的图片
         for i in range(len(novel_poses)):
             fixed_img_path = f"{self.render_dir}/novel/{step}/Fixed/{i:04d}.png"
             if os.path.exists(fixed_img_path):
@@ -1389,9 +1634,8 @@ class Runner:
                 valid_camtoworlds.append(novel_poses[i])
                 valid_camera_ids.append(self.parser.camera_ids[0])
                 
-        # 极端情况兜底：如果全部 OOM 导致一张图都没生成出来
         if len(valid_image_paths) == 0:
-            print(f"⚠️ [Warning] All {len(novel_poses)} images failed to generate at step {step} due to OOM. Skipping dataset addition.")
+            print(f"⚠️ [Warning] All {len(novel_poses)} images failed at step {step}. Skipping dataset addition.")
             self.current_novel_poses = novel_poses
             return
 
@@ -1401,10 +1645,9 @@ class Runner:
         parser.camtoworlds = np.array(valid_camtoworlds)
         parser.camera_ids = valid_camera_ids
         
-        print(f"Adding {len(parser.image_paths)} successfully fixed images to training set (Skipped {len(novel_poses) - len(parser.image_paths)} due to OOM)...")
+        print(f"Adding {len(parser.image_paths)} successfully fixed images to training set...")
         dataset = Dataset(parser, split="train")
         
-        # 设置 num_workers=0 以防止多进程内存溢出导致 Killed
         dataloader = torch.utils.data.DataLoader(
             dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0, pin_memory=False
         )
@@ -1412,7 +1655,6 @@ class Runner:
         self.novelloaders.append(dataloader)
         self.novelloaders_iter.append(iter(dataloader))
 
-        # 记录本次位姿，作为下一轮抬升的基准
         self.current_novel_poses = novel_poses
         print(f"✅ Step {step} reconstruction completed successfully.")
 
