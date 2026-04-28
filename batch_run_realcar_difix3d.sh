@@ -18,7 +18,7 @@ export CUDA_VISIBLE_DEVICES=1
 export CUDA_LAUNCH_BLOCKING=1
 
 # 2. 公共参数（所有场景共用）
-RESULT_TAG=recon_difix3d_realcar_v6_height_light_loss # 输出文件夹名
+RESULT_TAG=recon_difix3d_realcar_20k_v8_texture_bake # 输出文件夹名
 DATA_FACTOR=1
 
 # 3. 定义需要遍历的两个“主阵地”

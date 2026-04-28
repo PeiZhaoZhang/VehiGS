@@ -708,33 +708,35 @@ class Runner:
             )
 
             # ==============================================================
-            # loss 初始化
+            # loss 初始化与消融实验开关设定
             # ==============================================================
             loss_opacity_mask = torch.tensor(0.0, device=device)
             loss_alpha_tv = torch.tensor(0.0, device=device)
             loss_anisotropy = torch.tensor(0.0, device=device)
 
+            # 🎛️ [消融实验开关]
+            # True: 开启高光纹理烘焙 (第三点贡献) | False: 关闭，退回 baseline
+            ENABLE_TEXTURE_BAKING = True  
+            # True: 在真实视角下按位姿收集高光冲突热力图
+            ENABLE_GT_HEATMAP = True      
+
             # ==============================================================
-            # 🚀 [核心创新模块] RGSS: 残差引导的高光抑制与热力图可视化
+            # Difix 引导视角 (新视角) - 纯净结构蒸馏
             # ==============================================================
             if is_novel_data:
-                # --------------------------------------------------------------
-                # 🛡️ 终极维度防爆锁 (完美适配 [B, H, W, C] 或 [H, W, C])
-                # --------------------------------------------------------------
+                # 🛡️ 维度防爆锁 
                 is_4d = len(colors.shape) == 4
                 dim_h, dim_w = (1, 2) if is_4d else (0, 1)
                 target_h, target_w = colors.shape[dim_h], colors.shape[dim_w]
 
-                # 纠错：如果 Difix 传回来的图宽和高颠倒了
                 if pixels.shape[dim_h] == target_w and pixels.shape[dim_w] == target_h:
                     pixels = pixels.transpose(dim_h, dim_w).contiguous()
                     if alpha_masks is not None:
                         alpha_masks = alpha_masks.transpose(dim_h, dim_w).contiguous()
                         
-                # 1. 前景有效区域提取
+                # 前景有效区域提取
                 if alpha_masks is not None:
                     valid_foreground = (alpha_masks > 0.5).float()
-                    # 动态对齐：不管 colors 是 3D 还是 4D，确保有效掩码的通道数一致
                     while len(valid_foreground.shape) < len(colors.shape):
                         valid_foreground = valid_foreground.unsqueeze(-1)
                         
@@ -743,68 +745,16 @@ class Runner:
                 else:
                     valid_foreground = None
 
-                # 2. 计算绝对残差 (Detach)
-                with torch.no_grad():
-                    diff_map = torch.abs(colors.detach() - pixels.detach()).mean(dim=-1) 
-                    diff_min, diff_max = diff_map.min(), diff_map.max()
-                    # 归一化到 0~1，形成软高光掩码
-                    res_weight = (diff_map - diff_min) / (diff_max - diff_min + 1e-7)
-
-                # 3. 🎨 阈值触发式保存热力图 (包含背景遮罩 Mask 逻辑)
-                if not hasattr(self, "_last_heatmap_step"):
-                    self._last_heatmap_step = -500  
-
-                if step - self._last_heatmap_step >= 500:
-                    import cv2
-                    import numpy as np
-                    import os
-                    
-                    
-                    res_np = (res_weight.cpu().numpy() * 255).astype(np.uint8)
-                    pixels_cpu = pixels.detach().contiguous().cpu().numpy()
-                    colors_cpu = colors.detach().contiguous().cpu().numpy()
-                    
-                    # 提取 valid_foreground 用于热力图去背
-                    if valid_foreground is not None:
-                        mask_cpu = valid_foreground.detach().cpu().numpy()
-                    else:
-                        mask_cpu = None
-                    
-                    if is_4d:
-                        res_np = res_np[0]
-                        pixels_cpu = pixels_cpu[0]
-                        colors_cpu = colors_cpu[0]
-                        if mask_cpu is not None:
-                            mask_cpu = mask_cpu[0]
-                            
-                    heatmap_img = cv2.applyColorMap(res_np, cv2.COLORMAP_JET)
-                    
-                    # 🌟 核心修改：将 Alpha 掩码乘到热力图上，把背景的深蓝色直接变成纯黑色
-                    if mask_cpu is not None:
-                        heatmap_img = (heatmap_img * mask_cpu).astype(np.uint8)
-                    
-                    orig_np = (pixels_cpu * 255).astype(np.uint8)[:, :, ::-1]   
-                    render_np = (colors_cpu * 255).astype(np.uint8)[:, :, ::-1] 
-                    
-                    combo_img = np.concatenate((render_np, orig_np, heatmap_img), axis=1)
-                    
-                    save_path = os.path.join(self.heatmaps_dir, f"step_{step:05d}.png")
-                    cv2.imwrite(save_path, combo_img)
-
-                    self._last_heatmap_step = step
-                    
-                # 4. 💥 施加自适应残差加权 L1 Loss
-                penalty_factor = 5.0  
-                adaptive_mask = 1.0 + penalty_factor * res_weight.unsqueeze(-1) 
-                
+                # 纯净结构蒸馏
                 if valid_foreground is not None:
-                    adaptive_mask = adaptive_mask * valid_foreground
-                    l1loss = torch.sum(torch.abs(colors - pixels) * adaptive_mask) / (valid_foreground.sum() * 3 + 1e-7)
+                    l1loss = torch.sum(torch.abs(colors - pixels)) / (valid_foreground.sum() * 3 + 1e-7)
                 else:
-                    l1loss = (torch.abs(colors - pixels) * adaptive_mask).mean()
+                    l1loss = F.l1_loss(colors, pixels)
 
+            # ==============================================================
+            # 真实训练视角 (旧视角) - GT 约束与按位姿热力图取证
+            # ==============================================================
             else:
-                # --- 原始视角分支：使用真实的 GT masks 限制背景 ---
                 if masks is not None:
                     valid_mask = masks.unsqueeze(-1).float()
                     pixels = pixels * valid_mask
@@ -812,29 +762,94 @@ class Runner:
                     
                     l1loss = torch.sum(torch.abs(colors - pixels)) / (masks.sum() * 3 + 1e-7)
 
-                    # loss_opacity_mask 仅在原始真实视角下生效
                     if cfg.opacity_mask_reg > 0.0:
                         background_mask = 1.0 - valid_mask
                         loss_opacity_mask = (alphas * background_mask).mean()
                 else:
                     l1loss = F.l1_loss(colors, pixels)
+                    valid_mask = None
+
+                # 🎨 🚀 [论文图表取证] 自动追踪多视角，按 Milestone 保存
+                if ENABLE_GT_HEATMAP:
+                    with torch.no_grad():
+                        diff_map = torch.abs(colors.detach() - pixels.detach()).mean(dim=-1) 
+                        heatmap_max_threshold = 0.2 
+                        res_weight = torch.clamp(diff_map / heatmap_max_threshold, 0.0, 1.0)
+                    
+                    # 🎯 [完美修复] 直接利用你提取出的 image_ids 作为文件夹名
+                    # image_ids 通常是一个 Batch Tensor, 取第一个元素即可
+                    _cid = image_ids[0].item() if hasattr(image_ids[0], 'item') else image_ids[0]
+                    pose_name = f"pose_{int(_cid):04d}"  # 加上 04d 让文件夹 (如 pose_0005) 排序极其整齐
+                    
+                    if not hasattr(self, "_saved_poses_dict"):
+                        self._saved_poses_dict = {} # 记录 {pose_name: 已经保存过的 milestone_step}
+
+                    # 定义目标保存节点：3000, 6000, 9000...
+                    milestone = (step // 3000) * 3000
+
+                    # 触发条件：达到了新节点，且该位姿在此节点还没存过
+                    if milestone > 0 and step >= milestone:
+                        last_saved = self._saved_poses_dict.get(pose_name, -1)
+                        
+                        if last_saved < milestone:
+                            # 限制最多追踪 30 个不同的位姿
+                            if len(self._saved_poses_dict) < 30 or pose_name in self._saved_poses_dict:
+                                import cv2
+                                import numpy as np
+                                import os
+                                
+                                # 为每个位姿创建专属文件夹
+                                pose_dir = f"{cfg.result_dir}/renders/gt_heatmaps/{pose_name}"
+                                os.makedirs(pose_dir, exist_ok=True)
+                                
+                                is_4d = len(colors.shape) == 4
+                                res_np = (res_weight.cpu().numpy() * 255).astype(np.uint8)
+                                pixels_cpu = pixels.detach().contiguous().cpu().numpy()
+                                colors_cpu = colors.detach().contiguous().cpu().numpy()
+                                
+                                if valid_mask is not None:
+                                    mask_cpu = valid_mask.squeeze(-1).detach().cpu().numpy()
+                                else:
+                                    mask_cpu = None
+                                
+                                if is_4d:
+                                    res_np = res_np[0]
+                                    pixels_cpu = pixels_cpu[0]
+                                    colors_cpu = colors_cpu[0]
+                                    if mask_cpu is not None:
+                                        mask_cpu = mask_cpu[0]
+                                        
+                                heatmap_img = cv2.applyColorMap(res_np, cv2.COLORMAP_JET)
+                                
+                                if mask_cpu is not None: 
+                                    heatmap_img = (heatmap_img * np.expand_dims(mask_cpu, axis=-1)).astype(np.uint8)
+                                
+                                orig_np = (pixels_cpu * 255).astype(np.uint8)[:, :, ::-1]   
+                                render_np = (colors_cpu * 255).astype(np.uint8)[:, :, ::-1] 
+                                
+                                combo_img = np.concatenate((render_np, orig_np, heatmap_img), axis=1)
+                                baking_status = "BakeON" if ENABLE_TEXTURE_BAKING else "BakeOFF"
+                                
+                                # 文件名包含 step 和状态，存入对应位姿文件夹
+                                save_path = os.path.join(pose_dir, f"step_{milestone:05d}_{baking_status}.png")
+                                cv2.imwrite(save_path, combo_img)
+                                
+                                # 更新该位姿的保存记录
+                                self._saved_poses_dict[pose_name] = milestone
 
             # ==============================================================
             # 后续常规正则化项
             # ==============================================================
             
-            # Alpha TV 正则化
             if cfg.alpha_tv_reg > 0.0:
                 loss_alpha_tv = self.compute_tv_loss(alphas)
 
-            # 长短轴比例限制
             if cfg.anisotropy_reg > 0.0:
                 scales = torch.exp(self.splats["scales"])
                 max_s = torch.max(scales, dim=-1).values
                 min_s = torch.min(scales, dim=-1).values
                 loss_anisotropy = (max_s / (min_s + 1e-7)).mean()
 
-            # SSIM Loss
             ssimloss = 1.0 - fused_ssim(
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
@@ -866,15 +881,22 @@ class Runner:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
 
-            # regularizations
+            # 原有 regularizations
             if cfg.opacity_reg > 0.0:
                 loss += cfg.opacity_reg * torch.abs(torch.sigmoid(self.splats["opacities"])).mean()
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.abs(torch.exp(self.splats["scales"])).mean()
 
+            # ==============================================================
+            # 🚀 [核心创新三] 先验引导的高光纹理烘焙 (Prior-Guided Specular Texture Baking)
+            # ==============================================================
+            if ENABLE_TEXTURE_BAKING and "shN" in self.splats:
+                loss_sh_decay = (self.splats["shN"] ** 2).mean()
+                loss += 0.05 * loss_sh_decay  
+
             # 权重控制
             if is_novel_data:
-                loss = loss * cfg.novel_data_lambda  # 调大（1.5）
+                loss = loss * cfg.novel_data_lambda  
             else:
                 loss = loss * 1.5
                 
@@ -1143,8 +1165,8 @@ class Runner:
 
                 # 📐 3. 动态高分辨率控制 (按长边限制，完美兼容横竖屏)
                 # =========================================================
-                max_dim = 1024  # 限制整张图最长的那条边 (如果 OOM 可以调为 896)
-                
+                # max_dim = 1024  # 限制整张图最长的那条边 (如果 OOM 可以调为 896)
+                max_dim = 896
                 # 找到原图的“长边”
                 current_max = max(orig_w, orig_h)
                 
