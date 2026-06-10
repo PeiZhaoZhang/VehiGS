@@ -1,243 +1,150 @@
-# Difix3D+
+# VehiGS: Automated Vehicle Asset Reconstruction with Progressive Diffusion-Guided 3D Gaussian Splatting
 
-**Difix3D+: Improving 3D Reconstructions with Single-Step Diffusion Models**  
-[Jay Zhangjie Wu*](https://zhangjiewu.github.io/), [Yuxuan Zhang*](https://scholar.google.com/citations?user=Jt5VvNgAAAAJ&hl=en), [Haithem Turki](https://haithemturki.com/), [Xuanchi Ren](https://xuanchiren.com/), [Jun Gao](https://www.cs.toronto.edu/~jungao/),  
-[Mike Zheng Shou](https://sites.google.com/view/showlab/home?authuser=0), [Sanja Fidler](https://www.cs.utoronto.ca/~fidler/), [Zan Gojcic†](https://zgojcic.github.io/), [Huan Ling†](https://www.cs.toronto.edu/~linghuan/) _(*/† equal contribution/advising)_  
-CVPR 2025 (Oral)  
-[Project Page](https://research.nvidia.com/labs/toronto-ai/difix3d/) | [Paper](https://arxiv.org/abs/2503.01774) | [Model](https://huggingface.co/nvidia/difix) | [Demo](https://huggingface.co/spaces/nvidia/difix)
+This is the official repository for the paper **"VehiGS: Automated Vehicle Asset Reconstruction with Progressive Diffusion-Guided 3D Gaussian Splatting"**. 
 
-<div align="center">
-  <img src="assets/demo.gif" alt=""  width="1100" />
-</div>
+VehiGS is a dedicated 3D Gaussian Splatting (3DGS) framework designed for automated, high-fidelity 3D vehicle asset extraction directly from unconstrained, cluttered street scenes. 
 
+![VehiGS Framework](assets/framework.png)
 
-## News
+## 🌟 Overview
 
-* [11/06/2025] Code and models are now available! We will present our work at CVPR 2025 ([oral](https://cvpr.thecvf.com/virtual/2025/oral/35364), [poster](https://cvpr.thecvf.com/virtual/2025/poster/34172)). See you in Nashville🎵!
+Conventional workflows for extracting vehicle assets rely on tedious manual cleanup. VehiGS addresses this by progressively purifying, completing, and stabilizing the target asset using three core innovations:
+1. **S-ODMC (Spatial-Opacity Dual Mask Cleaning):** Isolates a clean vehicle support domain and suppresses background artifacts using spatial filtering and opacity penalties.
+2. **MACE (Manifold-Aware Controlled Enhancement):** Integrates single-step diffusion priors (via Difix) into neighboring pseudo-views to reconstruct missing geometries in under-observed regions.
+3. **BAKE (Appearance Stabilization Baking):** Attenuates unstable high-order spherical harmonics (SH) to resolve cross-view reflection conflicts and stabilize vehicle appearance.
 
+---
 
-## Setup
+## 💻 Hardware Requirements
 
-```bash
-git clone https://github.com/nv-tlabs/Difix3D.git
-cd Difix3D
-pip install -r requirements.txt
-```
+- **OS:** Ubuntu 20.04/22.04 or similar Linux distribution
+- **GPU:** A single NVIDIA GPU with **at least 24 GB VRAM** (e.g., RTX 3090, RTX 4090, or A5000) is required due to the memory overhead of concurrently running 3DGS optimization and Diffusion Model (MACE) inference.
+- **CUDA:** CUDA 11.8 or 12.1 is highly recommended for `gsplat` compatibility.
 
-## Quickstart (diffusers)
+---
 
-```
-from pipeline_difix import DifixPipeline
-from diffusers.utils import load_image
+## ⚙️ Environment Setup
 
-pipe = DifixPipeline.from_pretrained("nvidia/difix", trust_remote_code=True)
-pipe.to("cuda")
+We highly recommend using [Conda](https://docs.conda.io/en/latest/miniconda.html) to manage your environment. Since VehiGS relies on both 3D Gaussian Splatting (`gsplat`) and Diffusion Models (`diffusers`), please strictly follow the versions below.
 
-input_image = load_image("assets/example_input.png")
-prompt = "remove degradation"
-
-output_image = pipe(prompt, image=input_image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-output_image.save("example_output.png")
-```
-
-Optionally, you can use a reference image to guide the denoising process.
-```
-from pipeline_difix import DifixPipeline
-from diffusers.utils import load_image
-
-pipe = DifixPipeline.from_pretrained("nvidia/difix_ref", trust_remote_code=True)
-pipe.to("cuda")
-
-input_image = load_image("assets/example_input.png")
-ref_image = load_image("assets/example_ref.png")
-prompt = "remove degradation"
-
-output_image = pipe(prompt, image=input_image, ref_image=ref_image, num_inference_steps=1, timesteps=[199], guidance_scale=0.0).images[0]
-output_image.save("example_output.png")
-```
-
-## Difix: Single-step diffusion for 3D artifact removal
-
-### Training
-
-#### Data Preparation
-
-Prepare your dataset in the following JSON format:
-
-```json
-{
-  "train": {
-    "{data_id}": {
-      "image": "{PATH_TO_IMAGE}",
-      "target_image": "{PATH_TO_TARGET_IMAGE}",
-      "ref_image": "{PATH_TO_REF_IMAGE}",
-      "prompt": "remove degradation"
-    }
-  },
-  "test": {
-    "{data_id}": {
-      "image": "{PATH_TO_IMAGE}",
-      "target_image": "{PATH_TO_TARGET_IMAGE}",
-      "ref_image": "{PATH_TO_REF_IMAGE}",
-      "prompt": "remove degradation"
-    }
-  }
-}
-```
-
-#### Single GPU
+Run the following commands sequentially to set up your entire environment:
 
 ```bash
-accelerate launch --mixed_precision=bf16 src/train_difix.py \
-    --output_dir=./outputs/difix/train \
-    --dataset_path="data/data.json" \
-    --max_train_steps 10000 \
-    --resolution=512 --learning_rate 2e-5 \
-    --train_batch_size=1 --dataloader_num_workers 8 \
-    --enable_xformers_memory_efficient_attention \
-    --checkpointing_steps=1000 --eval_freq 1000 --viz_freq 100 \
-    --lambda_lpips 1.0 --lambda_l2 1.0 --lambda_gram 1.0 --gram_loss_warmup_steps 2000 \
-    --report_to "wandb" --tracker_project_name "difix" --tracker_run_name "train" --timestep 199
+# 1. Create and activate a Conda environment
+conda create -n vehigs python=3.10 -y
+conda activate vehigs
+
+# 2. Install PyTorch (matching your CUDA version, e.g., CUDA 11.8)
+pip install torch torchvision torchaudio --index-url [https://download.pytorch.org/whl/cu118](https://download.pytorch.org/whl/cu118)
+
+# 3. Install 3DGS & Rendering Dependencies
+pip install gsplat ninja
+
+# 4. Install Diffusion & Additional Dependencies
+pip install diffusers transformers accelerate xformers imageio viser tyro torchmetrics
 ```
 
-#### Multipe GPUs
+---
 
-```bash
-export NUM_NODES=1
-export NUM_GPUS=8
-accelerate launch --mixed_precision=bf16 --main_process_port 29501 --multi_gpu --num_machines $NUM_NODES --num_processes $NUM_GPUS src/train_difix.py \
-    --output_dir=./outputs/difix/train \
-    --dataset_path="data/data.json" \
-    --max_train_steps 10000 \
-    --resolution=512 --learning_rate 2e-5 \
-    --train_batch_size=1 --dataloader_num_workers 8 \
-    --enable_xformers_memory_efficient_attention \
-    --checkpointing_steps=1000 --eval_freq 1000 --viz_freq 100 \
-    --lambda_lpips 1.0 --lambda_l2 1.0 --lambda_gram 1.0 --gram_loss_warmup_steps 2000 \
-    --report_to "wandb" --tracker_project_name "difix" --tracker_run_name "train" --timestep 199
-```
+## 📂 Data Preparation
 
-### Inference
+VehiGS extracts vehicle assets from real-world captures (e.g., 3DRealCar, KRONC). To run the pipeline, your data must include **Foreground Masks** to separate the vehicle from the background. We recommend using an automated pipeline like **Grounding DINO + SAM 2** to generate these masks.
 
-Place the `model_*.pkl` in the `checkpoints` directory. You can run inference using the following command:
+The data should be organized in the standard COLMAP format, with an additional `masks` directory:
 
-```bash
-python src/inference_difix.py \
-    --model_path "checkpoints/model.pkl" \
-    --input_image "assets/example_input.png" \
-    --prompt "remove degradation" \
-    --output_dir "outputs/difix" \
-    --timestep 199
-```
-
-
-## Difix3D: Progressive 3D update
-
-### Data Format
-
-The data should be organized in the following structure:
-
-```
+```text
 DATA_DIR/
-├── {SCENE_ID}
-│   ├── colmap
-│   │   ├── sparse
-│   │   │   └── 0
-│   │   │       ├── cameras.bin
-│   │   │       ├── database.db
-│   │   │       └── ...
-│   ├── images
-│   │   ├── image_train_000001.png
-│   │   ├── image_train_000002.png
-│   │   ├── ...
-│   │   ├── image_eval_000200.png
-│   │   ├── image_eval_000201.png
-│   │   └── ...
-│   ├── images_2
-│   ├── images_4
-│   └── images_8
+├── {SCENE_ID}/
+│   ├── colmap/
+│   │   └── sparse/0/ (cameras.bin, images.bin, points3D.bin)
+│   ├── images/       (Original RGB images)
+│   ├── masks/        (Binary foreground masks generated by SAM 2)
 ```
 
-### nerfstudio
+---
 
-Setup the nerfstudio environment.
-```bash
-cd examples/nerfstudio
-pip install -e .
-cd ../..
-```
+## 🚀 Training & Reproduction
 
-Run Difix3D finetuning with nerfstudio.
-```bash
-SCENE_ID=032dee9fb0a8bc1b90871dc5fe950080d0bcd3caf166447f44e60ca50ac04ec7
-DATA=DATA_DIR/${SCENE_ID}
-DATA_FACTOR=4
-CKPT_PATH=CKPR_DIR/${SCENE_ID}/nerfacto/nerfstudio_models/step-000029999.ckpt # Path to the pretrained checkpoint file
-OUTPUT_DIR=outputs/difix3d/nerfacto/${SCENE_ID}
+VehiGS is designed to be an end-to-end automated pipeline. We provide a highly integrated training script `simple_trainer_VehiGS.py` that sequentially performs **S-ODMC (Purification)**, **MACE (Enhancement)**, and **BAKE (Stabilization)**.
 
-CUDA_VISIBLE_DEVICES=0 ns-train difix3d \
-    --data ${DATA} --pipeline.model.appearance-embed-dim 0 --pipeline.model.camera-optimizer.mode off --save_only_latest_checkpoint False --vis viewer \
-    --output_dir ${OUTPUT_DIR} --experiment_name ${SCENE_ID} --timestamp '' --load-checkpoint ${CKPT_PATH} \
-    --max_num_iterations 30000 --steps_per_eval_all_images 0 --steps_per_eval_batch 0 --steps_per_eval_image 0 --steps_per_save 2000 --viewer.quit-on-train-completion True \
-    nerfstudio-data --orientation-method none --center_method none --auto-scale-poses False --downscale_factor ${DATA_FACTOR} --eval_mode filename
-```
-
-### gsplat
-
-Install the gsplat following the instructions in the [gsplat repository](https://github.com/nerfstudio-project/gsplat?tab=readme-ov-file#installation).
-
-Run Difix3D finetuning with gsplat.
-```bash
-SCENE_ID=032dee9fb0a8bc1b90871dc5fe950080d0bcd3caf166447f44e60ca50ac04ec7
-DATA=DATA_DIR/${SCENE_ID}/gaussian_splat
-DATA_FACTOR=4
-CKPT_PATH=CKPT_DIR/${SCENE_ID}/ckpts/ckpt_29999_rank0.pt # Path to the pretrained checkpoint file
-OUTPUT_DIR=outputs/difix3d/gsplat/${SCENE_ID}
-
-CUDA_VISIBLE_DEVICES=0 python examples/gsplat/simple_trainer_difix3d.py default \
-    --data_dir ${DATA} --data_factor ${DATA_FACTOR} \
-    --result_dir ${OUTPUT_DIR} --no-normalize-world-space --test_every 1 --ckpt ${CKPT_PATH}
-```
-
-
-## Difix3D+: With real-time post-rendering
-
-Due to the limited capacity of reconstruction methods to represent sharp details, some regions remain blurry. To further enhance the novel views, we use our Difix model as the final post-processing step at render time.
+### 1. Set up PyColmap (Required for Camera Extrinsics)
+Before running, make sure the `pycolmap` path is correctly located. You can set it via an environment variable in your terminal:
 
 ```bash
-python src/inference_difix.py \
-    --model_path "checkpoints/model.pkl" \
-    --input_image "PATH_TO_IMAGES" \
-    --prompt "remove degradation" \
-    --output_dir "outputs/difix3d+" \
-    --timestep 199
+export PYCOLMAP_DIR="./pycolmap"
 ```
 
-## Acknowledgements
+### 2. Standard Training (End-to-End Extraction)
+To reconstruct a high-fidelity vehicle asset from a prepared scene, run the following command. This will activate all three core modules by default.
 
-Our work is built upon the following projects:
-- [diffusers](https://github.com/huggingface/diffusers)
-- [img2img-turbo](https://github.com/GaParmar/img2img-turbo)
-- [nerfstudio](https://github.com/nerfstudio-project/nerfstudio)
-- [gsplat](https://github.com/nerfstudio-project/gsplat)
-- [DL3DV-10K](https://github.com/DL3DV-10K/Dataset)
-- [nerfbusters](https://github.com/ethanweber/nerfbusters)
+```bash
+SCENE_ID="3DRealCar_Scene_01"
+DATA_DIR="./data/${SCENE_ID}"
+OUTPUT_DIR="./outputs/VehiGS/${SCENE_ID}"
 
-Shoutout to all the contributors of these projects for their invaluable work that made this research possible.
+CUDA_VISIBLE_DEVICES=0 python simple_trainer_VehiGS.py default \
+    --data_dir ${DATA_DIR} \
+    --result_dir ${OUTPUT_DIR} \
+    --no-normalize-world-space \
+    --test_every 8 \
+    --difix_model_path "nvidia/difix_ref" \
+    --use_s_odmc True \
+    --use_mace_diffusion True \
+    --use_texture_baking True
+```
 
-## License/Terms of Use:
+### 3. Ablation Studies Commands
+To reproduce the ablation studies presented in our paper, you can independently toggle our core modules via command-line arguments:
 
-The use of the model and code is governed by the NVIDIA License. See [LICENSE.txt](LICENSE.txt) for details.
-Additional Information:  [LICENSE.md · stabilityai/sd-turbo at main](https://huggingface.co/stabilityai/sd-turbo/blob/main/LICENSE.md)
+**Baseline (Native 3DGS without VehiGS enhancements):**
+```bash
+CUDA_VISIBLE_DEVICES=0 python simple_trainer_VehiGS.py default --data_dir ${DATA_DIR} --result_dir ${OUTPUT_DIR} --use_s_odmc False --use_mace_diffusion False --use_texture_baking False
+```
 
-## Citation
+**w/ S-ODMC (Purification Only):**
+```bash
+CUDA_VISIBLE_DEVICES=0 python simple_trainer_VehiGS.py default --data_dir ${DATA_DIR} --result_dir ${OUTPUT_DIR} --use_s_odmc True --use_mace_diffusion False --use_texture_baking False
+```
+
+**w/ S-ODMC + MACE (Purification + Local Diffusion Enhancement):**
+```bash
+CUDA_VISIBLE_DEVICES=0 python simple_trainer_VehiGS.py default --data_dir ${DATA_DIR} --result_dir ${OUTPUT_DIR} --use_s_odmc True --use_mace_diffusion True --use_texture_baking False
+```
+
+### 4. 👿 Memory Hog Mode (Cluster Utility)
+If you are running VehiGS on a shared HPC cluster, the diffusion model (MACE) frequently moves between RAM and GPU memory. To prevent other processes from stealing your VRAM during these offloading phases (which causes OOM errors), enable our memory hog mode:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python simple_trainer_VehiGS.py default --data_dir ${DATA_DIR} --result_dir ${OUTPUT_DIR} --memory_hog_mode True
+```
+*(Note: This will explicitly reserve all remaining GPU memory as a placeholder during the 3DGS training phase.)*
+
+---
+
+## 🎥 Rendering Final Assets
+
+The trainer automatically renders the final white-background vehicle assets and comparison videos at the specified `render_steps` (e.g., 30,000 and 60,000). The outputs will be saved in:
+`outputs/VehiGS/${SCENE_ID}/renders/final_eval/`
+
+---
+
+## 📖 Citation
+
+If you find our code or paper useful, please cite our work:
 
 ```bibtex
-@inproceedings{wu2025difix3d+,
-  title={DIFIX3D+: Improving 3D Reconstructions with Single-Step Diffusion Models},
-  author={Wu, Jay Zhangjie and Zhang, Yuxuan and Turki, Haithem and Ren, Xuanchi and Gao, Jun and Shou, Mike Zheng and Fidler, Sanja and Gojcic, Zan and Ling, Huan},
-  booktitle={Proceedings of the Computer Vision and Pattern Recognition Conference},
-  pages={26024--26035},
-  year={2025}
+@article{wang2026vehigs,
+  title={VehiGS: Automated Vehicle Asset Reconstruction with Progressive Diffusion-Guided 3D Gaussian Splatting},
+  author={Wang, Bing and Zhang, Peizhao and Yang, Zuofan and Zhang, Shiyin},
+  journal={arXiv preprint},
+  year={2026}
 }
 ```
+
+---
+
+## 📜 Acknowledgements & License
+
+This project builds upon the excellent work of [Difix3D+](https://github.com/nv-tlabs/Difix3D), [gsplat](https://github.com/nerfstudio-project/gsplat), and [SAM 2](https://github.com/facebookresearch/sam2).
+
+The use of this code and model is governed by the **NVIDIA License** and **Stability AI Community License**, which restrict usage to **non-commercial research and evaluation purposes only**. See `LICENSE.txt` for details.
